@@ -399,11 +399,9 @@ def fetch_board_data(
             )
             return games, all_books, {}
 
-    extra = " (202 challenge seen)" if challenge_seen else ""
-    raise DataFetchError(
-        f"Unable to fetch board data for {league}.{extra} "
-        f"Last status: {response.status_code}; no games returned from fallbacks."
-    )
+    # Graceful fallback: return empty board rather than raising.
+    # The app layer can show cached/last-known data when this happens.
+    return [], {}, {}
 
 
 def fetch_market_history(
@@ -1564,6 +1562,11 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
                     "Model projections use trend and injury context from each game detail page."
                     if include_model
                     else "Model projections disabled for compact output mode."
+                ),
+                (
+                    "Board feed returned 0 games in this run; app may use cached last non-empty snapshot."
+                    if not games
+                    else "Board feed returned active games normally."
                 ),
             ],
         },
