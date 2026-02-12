@@ -63,6 +63,23 @@ Each parameter pick now includes `model_alignment` so you can see whether model 
 python3 -m pip install -r requirements.txt
 ```
 
+## Streamlit dashboard
+
+Launch the UI:
+
+```bash
+python3 -m streamlit run app.py
+```
+
+Dashboard features:
+- tabs for Parameters 1/2/3, model projections, and raw JSON
+- filters by matchup text
+- optional "model-supported only" picks
+- minimum model-edge filter
+- auto-refresh interval control (for frequent checks as lines/games update)
+
+If loads feel slow, turn on **Fast mode** in the sidebar (skips per-game detail context for quicker refreshes).
+
 ## Usage
 
 Run with defaults:
