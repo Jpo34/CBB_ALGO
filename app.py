@@ -63,6 +63,9 @@ def build_engine_args(config: Dict[str, Any]) -> argparse.Namespace:
         public_metric=config["public_metric"],
         book_ids=config["book_ids"],
         max_workers=config["max_workers"],
+        skip_detail_context=config["skip_detail_context"],
+        request_timeout=config["request_timeout"],
+        request_retries=config["request_retries"],
         home_court_advantage=config["home_court_advantage"],
         alt_target_low=config["alt_target_low"],
         alt_target_high=config["alt_target_high"],
@@ -155,6 +158,16 @@ def main() -> None:
         )
         home_court_advantage = st.slider("Home-court advantage", 0.0, 6.0, 2.7, 0.1)
         max_workers = st.slider("Parallel workers", 1, 20, 10, 1)
+        fast_mode = st.toggle(
+            "Fast mode (skip detail context)",
+            value=True,
+            help=(
+                "Faster loads by skipping per-game detail pages "
+                "(injury/trend context)."
+            ),
+        )
+        request_timeout = st.slider("Request timeout (sec)", 5, 40, 15, 1)
+        request_retries = st.slider("Request retries", 1, 5, 2, 1)
 
         st.subheader("Parameter 3 odds target")
         alt_target_low = st.number_input("Target low", value=-250, step=5)
@@ -196,6 +209,9 @@ def main() -> None:
         "public_metric": public_metric,
         "book_ids": ",".join(str(book_id) for book_id in selected_books),
         "max_workers": int(max_workers),
+        "skip_detail_context": bool(fast_mode),
+        "request_timeout": int(request_timeout),
+        "request_retries": int(request_retries),
         "home_court_advantage": float(home_court_advantage),
         "alt_target_low": int(alt_target_low),
         "alt_target_high": int(alt_target_high),
@@ -203,12 +219,25 @@ def main() -> None:
     }
     config_json = json.dumps(config, sort_keys=True)
 
+    st.info(
+        "Loading live data now... If this feels stuck, enable Fast mode, "
+        "lower retries, or click Refresh now."
+    )
     with st.spinner("Pulling live games, lines, and model context..."):
         try:
             report = load_report_cached(config_json, refresh_key)
         except Exception as exc:
-            st.error(f"Failed to load report: {exc}")
-            st.stop()
+            fallback_report = st.session_state.get("last_successful_report")
+            if fallback_report:
+                st.warning(
+                    f"Live refresh failed ({exc}). Showing last successful snapshot."
+                )
+                report = fallback_report
+            else:
+                st.error(f"Failed to load report: {exc}")
+                st.stop()
+        else:
+            st.session_state["last_successful_report"] = report
 
     metadata = report.get("metadata", {})
     all_games_snapshot = report.get("all_games_snapshot", [])
@@ -227,11 +256,17 @@ def main() -> None:
     col6.metric("Parameter 3", len(parameter_3))
 
     st.caption(
-        "Generated: {generated} | Public metric: {metric} | Threshold: {threshold}% | Books: {books}".format(
+        "Generated: {generated} | Public metric: {metric} | Threshold: {threshold}% | "
+        "Books: {books} | Detail context: {detail_context} | Timeout: {timeout}s x {retries}".format(
             generated=metadata.get("generated_at_utc", "unknown"),
             metric=metadata.get("public_metric", "unknown"),
             threshold=metadata.get("public_threshold_pct", "unknown"),
             books=", ".join(str(x) for x in metadata.get("preferred_book_ids", [])),
+            detail_context=(
+                "on" if metadata.get("detail_context_enabled", True) else "off (fast mode)"
+            ),
+            timeout=metadata.get("request_timeout_seconds", "unknown"),
+            retries=metadata.get("request_retries", "unknown"),
         )
     )
 

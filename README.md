@@ -68,7 +68,7 @@ python3 -m pip install -r requirements.txt
 Launch the UI:
 
 ```bash
-streamlit run app.py
+python3 -m streamlit run app.py
 ```
 
 Dashboard features:
@@ -77,6 +77,8 @@ Dashboard features:
 - optional "model-supported only" picks
 - minimum model-edge filter
 - auto-refresh interval control (for frequent checks as lines/games update)
+
+If loads feel slow, turn on **Fast mode** in the sidebar (skips per-game detail context for quicker refreshes).
 
 ## Usage
 

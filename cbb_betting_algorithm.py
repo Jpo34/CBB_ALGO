@@ -42,6 +42,8 @@ DEFAULT_BOOK_IDS = [68, 69, 71, 75, 79]
 DEFAULT_PUBLIC_THRESHOLD = 70.0
 DEFAULT_REFRESH_INTERVAL_SECONDS = 120
 DEFAULT_HOME_COURT_ADVANTAGE = 2.7
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 20
+DEFAULT_REQUEST_RETRIES = 3
 
 INJURY_STATUS_WEIGHTS = {
     "out_for_season": 1.35,
@@ -146,13 +148,19 @@ def parse_next_data(html: str) -> Dict[str, Any]:
 
 
 def fetch_board_data(
-    session: requests.Session, league: str
+    session: requests.Session,
+    league: str,
+    *,
+    request_timeout: int,
+    request_retries: int,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]], Dict[int, str]]:
     page_url = f"{ACTION_SITE_ROOT}/{league}/public-betting"
     response = request_with_retries(
         session,
         page_url,
         params={"_ts": int(time.time() * 1000)},
+        timeout=request_timeout,
+        retries=request_retries,
     )
     if response.status_code != 200:
         raise DataFetchError(
@@ -181,11 +189,22 @@ def fetch_board_data(
 
 
 def fetch_market_history(
-    session: requests.Session, game_id: int, book_ids: Iterable[int]
+    session: requests.Session,
+    game_id: int,
+    book_ids: Iterable[int],
+    *,
+    request_timeout: int,
+    request_retries: int,
 ) -> Dict[str, Any]:
     url = f"{ACTION_API_ROOT}/v2/markets/event/{game_id}/history"
     params = {"bookIds": ",".join(str(x) for x in book_ids)}
-    response = request_with_retries(session, url, params=params)
+    response = request_with_retries(
+        session,
+        url,
+        params=params,
+        timeout=request_timeout,
+        retries=request_retries,
+    )
     if response.status_code == 404:
         return {}
     if response.status_code != 200:
@@ -196,7 +215,12 @@ def fetch_market_history(
 
 
 def fetch_game_detail_context(
-    session: requests.Session, game_id: int, game_url: Optional[str]
+    session: requests.Session,
+    game_id: int,
+    game_url: Optional[str],
+    *,
+    request_timeout: int,
+    request_retries: int,
 ) -> Dict[str, Any]:
     if not game_url:
         return {}
@@ -205,6 +229,8 @@ def fetch_game_detail_context(
         session,
         game_url,
         params={"_ts": int(time.time() * 1000)},
+        timeout=request_timeout,
+        retries=request_retries,
     )
     if response.status_code != 200:
         raise DataFetchError(
@@ -902,7 +928,12 @@ def build_game_snapshot(
 def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
     session = requests.Session()
 
-    games, all_books, game_links = fetch_board_data(session, args.league)
+    games, all_books, game_links = fetch_board_data(
+        session,
+        args.league,
+        request_timeout=args.request_timeout,
+        request_retries=args.request_retries,
+    )
     preferred_book_ids = [int(x) for x in args.book_ids.split(",") if x.strip()]
 
     histories: Dict[int, Dict[str, Any]] = {}
@@ -917,17 +948,21 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
                     session,
                     game_id,
                     preferred_book_ids,
+                    request_timeout=args.request_timeout,
+                    request_retries=args.request_retries,
                 )
             ] = ("history", game_id)
 
             game_url = game_links.get(game_id)
-            if game_url:
+            if game_url and not args.skip_detail_context:
                 future_map[
                     executor.submit(
                         fetch_game_detail_context,
                         session,
                         game_id,
                         game_url,
+                        request_timeout=args.request_timeout,
+                        request_retries=args.request_retries,
                     )
                 ] = ("detail", game_id)
 
@@ -1230,6 +1265,9 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
             "public_threshold_pct": args.public_threshold,
             "public_metric": args.public_metric,
             "home_court_advantage": args.home_court_advantage,
+            "detail_context_enabled": not args.skip_detail_context,
+            "request_timeout_seconds": args.request_timeout,
+            "request_retries": args.request_retries,
             "preferred_book_ids": preferred_book_ids,
             "preferred_sportsbooks": [
                 {
@@ -1296,6 +1334,26 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
         type=int,
         default=10,
         help="Max worker threads for per-game history calls (default: 10).",
+    )
+    parser.add_argument(
+        "--skip-detail-context",
+        action="store_true",
+        help=(
+            "Skip per-game detail page pulls (trends/injuries) for faster loads. "
+            "Model will still run with reduced context."
+        ),
+    )
+    parser.add_argument(
+        "--request-timeout",
+        type=int,
+        default=DEFAULT_REQUEST_TIMEOUT_SECONDS,
+        help=f"HTTP request timeout seconds (default: {DEFAULT_REQUEST_TIMEOUT_SECONDS}).",
+    )
+    parser.add_argument(
+        "--request-retries",
+        type=int,
+        default=DEFAULT_REQUEST_RETRIES,
+        help=f"HTTP request retries (default: {DEFAULT_REQUEST_RETRIES}).",
     )
     parser.add_argument(
         "--home-court-advantage",
