@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from collections import defaultdict
 from typing import Any, Dict, List, Tuple
 
@@ -25,6 +26,23 @@ DEFAULT_BOOK_OPTIONS = [
     (75, "BetMGM"),
     (79, "bet365"),
 ]
+LOCAL_CACHE_PATH = ".streamlit_cache/last_non_empty_report.json"
+
+
+def load_local_cached_report() -> Dict[str, Any] | None:
+    if not os.path.exists(LOCAL_CACHE_PATH):
+        return None
+    try:
+        with open(LOCAL_CACHE_PATH, "r", encoding="utf-8") as file_handle:
+            return json.load(file_handle)
+    except Exception:
+        return None
+
+
+def save_local_cached_report(report: Dict[str, Any]) -> None:
+    os.makedirs(os.path.dirname(LOCAL_CACHE_PATH), exist_ok=True)
+    with open(LOCAL_CACHE_PATH, "w", encoding="utf-8") as file_handle:
+        json.dump(report, file_handle)
 
 
 def build_engine_args(config: Dict[str, Any]) -> argparse.Namespace:
@@ -422,8 +440,15 @@ def main() -> None:
                 st.warning(f"Live refresh failed ({exc}). Showing last successful snapshot.")
                 report = fallback_report
             else:
-                st.error(f"Failed to load report: {exc}")
-                st.stop()
+                disk_cache = load_local_cached_report()
+                if disk_cache:
+                    st.warning(
+                        f"Live refresh failed ({exc}). Showing locally cached snapshot."
+                    )
+                    report = disk_cache
+                else:
+                    st.error(f"Failed to load report: {exc}")
+                    st.stop()
         else:
             st.session_state["last_successful_report"] = report
 
@@ -435,11 +460,18 @@ def main() -> None:
             report = last_non_empty
             game_count = len(report.get("all_games_snapshot", []))
         else:
-            st.warning(
-                "Live source returned 0 games. This can happen temporarily while odds providers update."
-            )
+            disk_cache = load_local_cached_report()
+            if isinstance(disk_cache, dict) and len(disk_cache.get("all_games_snapshot", [])) > 0:
+                st.warning("Live source returned 0 games. Showing locally cached snapshot.")
+                report = disk_cache
+                game_count = len(report.get("all_games_snapshot", []))
+            else:
+                st.warning(
+                    "Live source returned 0 games. This can happen temporarily while odds providers update."
+                )
     else:
         st.session_state["last_non_empty_report"] = report
+        save_local_cached_report(report)
 
     metadata = report.get("metadata", {})
     entries = normalize_parameter_entries(report)
