@@ -147,34 +147,7 @@ def parse_next_data(html: str) -> Dict[str, Any]:
     return json.loads(match.group(1))
 
 
-def fetch_board_data(
-    session: requests.Session,
-    league: str,
-    *,
-    request_timeout: int,
-    request_retries: int,
-) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]], Dict[int, str]]:
-    page_url = f"{ACTION_SITE_ROOT}/{league}/public-betting"
-    response = request_with_retries(
-        session,
-        page_url,
-        params={"_ts": int(time.time() * 1000)},
-        timeout=request_timeout,
-        retries=request_retries,
-    )
-    if response.status_code != 200:
-        raise DataFetchError(
-            f"Unexpected status code {response.status_code} for {page_url}"
-        )
-
-    html = response.text
-    next_data = parse_next_data(html)
-    page_props = next_data.get("props", {}).get("pageProps", {})
-    scoreboard = page_props.get("scoreboardResponse", {})
-    games = scoreboard.get("games", [])
-    all_books = page_props.get("allBooks", {})
-
-    # Build a game_id -> detail page URL map.
+def build_game_links_from_html(html: str, league: str) -> Dict[int, str]:
     game_route_prefix = re.escape(f"/{league}-game/")
     game_href_regex = rf'href="({game_route_prefix}[^"]+/(\d+))"'
     game_links: Dict[int, str] = {}
@@ -184,8 +157,171 @@ def fetch_board_data(
         except ValueError:
             continue
         game_links[game_id] = f"{ACTION_SITE_ROOT}{href}"
+    return game_links
 
-    return games, all_books, game_links
+
+def extract_board_from_page_props(
+    page_props: Dict[str, Any],
+) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+    scoreboard = page_props.get("scoreboardResponse", {})
+    games = scoreboard.get("games", [])
+    all_books = page_props.get("allBooks", {})
+    return games, all_books
+
+
+def parse_board_html_payload(
+    html: str, league: str
+) -> Optional[Tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]], Dict[int, str], str]]:
+    try:
+        next_data = parse_next_data(html)
+    except Exception:
+        return None
+    page_props = next_data.get("props", {}).get("pageProps", {})
+    games, all_books = extract_board_from_page_props(page_props)
+    game_links = build_game_links_from_html(html, league)
+    build_id = str(next_data.get("buildId") or "")
+    return games, all_books, game_links, build_id
+
+
+def fetch_next_data_board(
+    session: requests.Session,
+    *,
+    league: str,
+    build_id: str,
+    route_name: str,
+    request_timeout: int,
+    request_retries: int,
+) -> Optional[Tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]], Dict[int, str]]]:
+    url = f"{ACTION_SITE_ROOT}/_next/data/{build_id}/{league}/{route_name}.json"
+    response = request_with_retries(
+        session,
+        url,
+        params={"_ts": int(time.time() * 1000)},
+        timeout=request_timeout,
+        retries=request_retries,
+    )
+    if response.status_code != 200:
+        return None
+    try:
+        payload = response.json()
+    except Exception:
+        return None
+    page_props = payload.get("pageProps", {})
+    games, all_books = extract_board_from_page_props(page_props)
+    return games, all_books, {}
+
+
+def fetch_books_index(
+    session: requests.Session,
+    *,
+    request_timeout: int,
+    request_retries: int,
+) -> Dict[str, Dict[str, Any]]:
+    url = f"{ACTION_API_ROOT}/v1/books"
+    response = request_with_retries(
+        session,
+        url,
+        timeout=request_timeout,
+        retries=request_retries,
+    )
+    if response.status_code != 200:
+        return {}
+    try:
+        payload = response.json()
+    except Exception:
+        return {}
+    books = payload.get("books")
+    if not isinstance(books, list):
+        return {}
+    return {str(book.get("id")): book for book in books if isinstance(book, dict)}
+
+
+def fetch_board_data(
+    session: requests.Session,
+    league: str,
+    *,
+    request_timeout: int,
+    request_retries: int,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]], Dict[int, str]]:
+    # Try HTML routes first.
+    candidate_paths = [f"/{league}/public-betting", f"/{league}/odds"]
+    discovered_build_id = ""
+    challenge_seen = False
+    for path in candidate_paths:
+        url = f"{ACTION_SITE_ROOT}{path}"
+        for attempt in range(1, request_retries + 1):
+            response = request_with_retries(
+                session,
+                url,
+                params={"_ts": int(time.time() * 1000)},
+                timeout=request_timeout,
+                retries=request_retries,
+            )
+            parsed = parse_board_html_payload(response.text, league)
+            if parsed:
+                games, all_books, game_links, build_id = parsed
+                if build_id:
+                    discovered_build_id = build_id
+                if response.status_code in (200, 202):
+                    return games, all_books, game_links
+            if response.status_code == 202 and attempt < request_retries:
+                challenge_seen = True
+                time.sleep(min(4, attempt + 1))
+                continue
+            break
+
+    # If HTML is challenged or unavailable, use Next.js data route fallback.
+    if not discovered_build_id:
+        league_url = f"{ACTION_SITE_ROOT}/{league}"
+        response = request_with_retries(
+            session,
+            league_url,
+            params={"_ts": int(time.time() * 1000)},
+            timeout=request_timeout,
+            retries=request_retries,
+        )
+        parsed = parse_board_html_payload(response.text, league)
+        if parsed:
+            _, _, _, build_id = parsed
+            discovered_build_id = build_id
+
+    if discovered_build_id:
+        for route_name in ("public-betting", "odds"):
+            next_data_result = fetch_next_data_board(
+                session,
+                league=league,
+                build_id=discovered_build_id,
+                route_name=route_name,
+                request_timeout=request_timeout,
+                request_retries=request_retries,
+            )
+            if next_data_result is not None:
+                games, all_books, game_links = next_data_result
+                return games, all_books, game_links
+
+    # Last fallback: API scoreboard + books index.
+    scoreboard_url = f"{ACTION_API_ROOT}/v1/scoreboard/{league}"
+    response = request_with_retries(
+        session,
+        scoreboard_url,
+        timeout=request_timeout,
+        retries=request_retries,
+    )
+    if response.status_code == 200:
+        payload = response.json()
+        games = payload.get("games", [])
+        all_books = fetch_books_index(
+            session,
+            request_timeout=request_timeout,
+            request_retries=request_retries,
+        )
+        return games, all_books, {}
+
+    extra = " (202 challenge seen)" if challenge_seen else ""
+    raise DataFetchError(
+        f"Unable to fetch board data for {league}.{extra} "
+        f"Last status: {response.status_code}"
+    )
 
 
 def fetch_market_history(
