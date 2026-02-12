@@ -315,6 +315,89 @@ def fetch_books_index(
     return {str(book.get("id")): book for book in books if isinstance(book, dict)}
 
 
+def fetch_game_stub_from_url(
+    session: requests.Session,
+    *,
+    game_url: str,
+    request_timeout: int,
+    request_retries: int,
+) -> Optional[Dict[str, Any]]:
+    response = request_with_retries(
+        session,
+        game_url,
+        params={"_ts": int(time.time() * 1000)},
+        timeout=request_timeout,
+        retries=request_retries,
+    )
+    if response.status_code not in (200, 202):
+        return None
+    try:
+        page_props = parse_next_data(response.text).get("props", {}).get("pageProps", {})
+    except Exception:
+        return None
+    game = page_props.get("game")
+    if not isinstance(game, dict):
+        return None
+    game_id = game.get("id")
+    if not isinstance(game_id, int):
+        return None
+    if not isinstance(game.get("teams"), list):
+        return None
+
+    return {
+        "id": game_id,
+        "start_time": game.get("start_time"),
+        "home_team_id": game.get("home_team_id"),
+        "away_team_id": game.get("away_team_id"),
+        "teams": game.get("teams"),
+        "num_bets": game.get("num_bets"),
+    }
+
+
+def hydrate_games_from_links(
+    session: requests.Session,
+    *,
+    game_links: Dict[int, str],
+    request_timeout: int,
+    request_retries: int,
+    max_workers: int = 8,
+) -> List[Dict[str, Any]]:
+    hydrated: Dict[int, Dict[str, Any]] = {}
+    if not game_links:
+        return []
+
+    worker_count = max(1, min(max_workers, len(game_links)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
+        future_map = {
+            executor.submit(
+                fetch_game_stub_from_url,
+                session,
+                game_url=url,
+                request_timeout=request_timeout,
+                request_retries=request_retries,
+            ): game_id
+            for game_id, url in game_links.items()
+        }
+        for future in concurrent.futures.as_completed(future_map):
+            try:
+                stub = future.result()
+            except Exception:  # pragma: no cover - network dependent
+                stub = None
+            if not stub:
+                continue
+            hydrated[int(stub["id"])] = stub
+
+    games = list(hydrated.values())
+    games.sort(
+        key=lambda game: (
+            parse_iso(game["start_time"]).timestamp()
+            if game.get("start_time")
+            else float("inf")
+        )
+    )
+    return games
+
+
 def fetch_board_data(
     session: requests.Session,
     league: str,
@@ -326,6 +409,8 @@ def fetch_board_data(
     candidate_paths = [f"/{league}/public-betting", f"/{league}/odds"]
     discovered_build_id = ""
     challenge_seen = False
+    collected_game_links: Dict[int, str] = {}
+    fallback_all_books: Dict[str, Dict[str, Any]] = {}
     for path in candidate_paths:
         url = f"{ACTION_SITE_ROOT}{path}"
         for attempt in range(1, request_retries + 1):
@@ -339,6 +424,9 @@ def fetch_board_data(
             parsed = parse_board_html_payload(response.text, league)
             if parsed:
                 games, all_books, game_links, build_id = parsed
+                collected_game_links.update(game_links)
+                if all_books:
+                    fallback_all_books = all_books
                 if build_id:
                     discovered_build_id = build_id
                 # Only accept this source if we actually got games.
@@ -378,7 +466,9 @@ def fetch_board_data(
             if next_data_result is not None:
                 games, all_books, game_links = next_data_result
                 if games:
-                    return games, all_books, game_links
+                    merged_links = dict(collected_game_links)
+                    merged_links.update(game_links or {})
+                    return games, all_books, merged_links
 
     # Last fallback: API scoreboard + books index.
     scoreboard_url = f"{ACTION_API_ROOT}/v1/scoreboard/{league}"
@@ -397,7 +487,24 @@ def fetch_board_data(
                 request_timeout=request_timeout,
                 request_retries=request_retries,
             )
-            return games, all_books, {}
+            return games, all_books, collected_game_links
+
+    # Fallback via game links extracted from challenged HTML.
+    if collected_game_links:
+        hydrated_games = hydrate_games_from_links(
+            session,
+            game_links=collected_game_links,
+            request_timeout=request_timeout,
+            request_retries=request_retries,
+            max_workers=8,
+        )
+        if hydrated_games:
+            all_books = fallback_all_books or fetch_books_index(
+                session,
+                request_timeout=request_timeout,
+                request_retries=request_retries,
+            )
+            return hydrated_games, all_books, collected_game_links
 
     # Graceful fallback: return empty board rather than raising.
     # The app layer can show cached/last-known data when this happens.
