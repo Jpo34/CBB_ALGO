@@ -200,7 +200,14 @@ def request_with_retries(
                 url,
                 params=params,
                 timeout=timeout,
-                headers={"User-Agent": USER_AGENT},
+                headers={
+                    "User-Agent": USER_AGENT,
+                    "Accept": "text/html,application/json,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Cache-Control": "no-cache",
+                    "Pragma": "no-cache",
+                    "Referer": ACTION_SITE_ROOT,
+                },
             )
             if response.status_code >= 500 and attempt < retries:
                 time.sleep(2 ** attempt)
@@ -260,6 +267,18 @@ def parse_board_html_payload(
     game_links = build_game_links_from_html(html, league)
     build_id = str(next_data.get("buildId") or "")
     return games, all_books, game_links, build_id
+
+
+def extract_build_id_from_html(html: str) -> str:
+    patterns = [
+        r'/_next/static/([^/]+)/_buildManifest\.js',
+        r'"buildId":"([^"]+)"',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, html)
+        if match:
+            return str(match.group(1))
+    return ""
 
 
 def fetch_next_data_board(
@@ -406,7 +425,7 @@ def fetch_board_data(
     request_retries: int,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]], Dict[int, str]]:
     # Try HTML routes first.
-    candidate_paths = [f"/{league}/public-betting", f"/{league}/odds"]
+    candidate_paths = [f"/{league}/public-betting", f"/{league}/odds", f"/{league}"]
     discovered_build_id = ""
     challenge_seen = False
     collected_game_links: Dict[int, str] = {}
@@ -421,7 +440,17 @@ def fetch_board_data(
                 timeout=request_timeout,
                 retries=request_retries,
             )
-            parsed = parse_board_html_payload(response.text, league)
+            html = response.text
+
+            links_from_html = build_game_links_from_html(html, league)
+            if links_from_html:
+                collected_game_links.update(links_from_html)
+
+            extracted_build = extract_build_id_from_html(html)
+            if extracted_build and not discovered_build_id:
+                discovered_build_id = extracted_build
+
+            parsed = parse_board_html_payload(html, league)
             if parsed:
                 games, all_books, game_links, build_id = parsed
                 collected_game_links.update(game_links)
