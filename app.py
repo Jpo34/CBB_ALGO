@@ -78,6 +78,11 @@ def build_engine_args(config: Dict[str, Any]) -> argparse.Namespace:
     )
 
 
+def run_report_uncached(config: Dict[str, Any]) -> Dict[str, Any]:
+    args = build_engine_args(config)
+    return run_analysis(args)
+
+
 @st.cache_data(show_spinner=False)
 def load_report_cached(config_json: str, refresh_key: int) -> Dict[str, Any]:
     del refresh_key
@@ -444,7 +449,7 @@ def main() -> None:
             fast_mode = st.toggle("Fast mode", value=True)
             advanced_triggers = st.toggle(
                 "Advanced form triggers",
-                value=True,
+                value=False,
                 help=(
                     "Adds last-10/top-tier/venue/ATS style triggers to pick scoring. "
                     "Requires deeper game context."
@@ -533,9 +538,30 @@ def main() -> None:
                 report = disk_cache
                 game_count = len(report.get("all_games_snapshot", []))
             else:
-                st.warning(
-                    "Live source returned 0 games. This can happen temporarily while odds providers update."
-                )
+                retry_config = dict(config)
+                retry_config["include_advanced_triggers"] = False
+                retry_config["skip_detail_context"] = True
+                retry_config["request_retries"] = max(3, int(config["request_retries"]))
+                retry_config["request_timeout"] = max(15, int(config["request_timeout"]))
+                with st.spinner("Retrying with fallback fast settings..."):
+                    try:
+                        retry_report = run_report_uncached(retry_config)
+                    except Exception:
+                        retry_report = {}
+                retry_games = len(retry_report.get("all_games_snapshot", []))
+                if retry_games > 0:
+                    st.success(
+                        "Recovered games using fallback fast settings "
+                        "(advanced triggers temporarily disabled for this refresh)."
+                    )
+                    report = retry_report
+                    game_count = retry_games
+                    st.session_state["last_non_empty_report"] = report
+                    save_local_cached_report(report)
+                else:
+                    st.warning(
+                        "Live source returned 0 games. This can happen temporarily while odds providers update."
+                    )
     else:
         st.session_state["last_non_empty_report"] = report
         save_local_cached_report(report)
