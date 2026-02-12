@@ -277,7 +277,8 @@ def fetch_board_data(
                 games, all_books, game_links, build_id = parsed
                 if build_id:
                     discovered_build_id = build_id
-                if response.status_code in (200, 202):
+                # Only accept this source if we actually got games.
+                if response.status_code in (200, 202) and games:
                     return games, all_books, game_links
             if response.status_code == 202 and attempt < request_retries:
                 challenge_seen = True
@@ -312,7 +313,8 @@ def fetch_board_data(
             )
             if next_data_result is not None:
                 games, all_books, game_links = next_data_result
-                return games, all_books, game_links
+                if games:
+                    return games, all_books, game_links
 
     # Last fallback: API scoreboard + books index.
     scoreboard_url = f"{ACTION_API_ROOT}/v1/scoreboard/{league}"
@@ -325,17 +327,18 @@ def fetch_board_data(
     if response.status_code == 200:
         payload = response.json()
         games = payload.get("games", [])
-        all_books = fetch_books_index(
-            session,
-            request_timeout=request_timeout,
-            request_retries=request_retries,
-        )
-        return games, all_books, {}
+        if games:
+            all_books = fetch_books_index(
+                session,
+                request_timeout=request_timeout,
+                request_retries=request_retries,
+            )
+            return games, all_books, {}
 
     extra = " (202 challenge seen)" if challenge_seen else ""
     raise DataFetchError(
         f"Unable to fetch board data for {league}.{extra} "
-        f"Last status: {response.status_code}"
+        f"Last status: {response.status_code}; no games returned from fallbacks."
     )
 
 

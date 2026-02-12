@@ -366,6 +366,20 @@ def main() -> None:
         else:
             st.session_state["last_successful_report"] = report
 
+    game_count = len(report.get("all_games_snapshot", []))
+    if game_count == 0:
+        last_non_empty = st.session_state.get("last_non_empty_report")
+        if isinstance(last_non_empty, dict) and len(last_non_empty.get("all_games_snapshot", [])) > 0:
+            st.warning("Live source returned 0 games. Showing last non-empty snapshot.")
+            report = last_non_empty
+            game_count = len(report.get("all_games_snapshot", []))
+        else:
+            st.warning(
+                "Live source returned 0 games. This can happen temporarily while odds providers update."
+            )
+    else:
+        st.session_state["last_non_empty_report"] = report
+
     metadata = report.get("metadata", {})
     entries = normalize_parameter_entries(report)
     top_recommendations = aggregate_top_recommendations(entries)
@@ -375,7 +389,6 @@ def main() -> None:
         report.get("parameter_2", {}).get("totals", [])
     )
     p3_count = len(report.get("parameter_3", []))
-    game_count = len(report.get("all_games_snapshot", []))
 
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Games", game_count)
