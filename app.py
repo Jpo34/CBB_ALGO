@@ -53,6 +53,7 @@ def build_engine_args(config: Dict[str, Any]) -> argparse.Namespace:
         book_ids=config["book_ids"],
         max_workers=config["max_workers"],
         include_model=False,
+        include_advanced_triggers=config["include_advanced_triggers"],
         compact_output=True,
         skip_detail_context=config["skip_detail_context"],
         request_timeout=config["request_timeout"],
@@ -61,6 +62,13 @@ def build_engine_args(config: Dict[str, Any]) -> argparse.Namespace:
         alt_target_low=-250,
         alt_target_high=-200,
         alt_target_mid=-225,
+        trigger_last10_threshold=0.15,
+        trigger_top_tier_threshold=0.1,
+        trigger_venue_threshold=0.12,
+        trigger_ats_threshold=0.15,
+        trigger_total_trend_threshold=0.08,
+        trigger_top25_min_games=2,
+        trigger_over500_min_games=4,
         output="",
         watch=False,
         interval_seconds=0,
@@ -131,6 +139,9 @@ def normalize_parameter_entries(report: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "season_support": season.get("supports_pick"),
                 "season_pick_record": season.get("pick_team_record"),
                 "season_opp_record": season.get("opponent_record"),
+                "advanced_score": record.get("advanced_trigger_score"),
+                "advanced_support": record.get("advanced_trigger_support"),
+                "advanced_hits": record.get("advanced_trigger_hits"),
                 "reason": record.get("reason"),
             }
         )
@@ -160,6 +171,9 @@ def normalize_parameter_entries(report: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "season_support": season.get("supports_pick"),
                 "season_pick_record": season.get("pick_team_record"),
                 "season_opp_record": season.get("opponent_record"),
+                "advanced_score": record.get("advanced_trigger_score"),
+                "advanced_support": record.get("advanced_trigger_support"),
+                "advanced_hits": record.get("advanced_trigger_hits"),
                 "reason": record.get("reason"),
             }
         )
@@ -189,6 +203,9 @@ def normalize_parameter_entries(report: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "season_support": None,
                 "season_pick_record": season.get("home_record"),
                 "season_opp_record": season.get("away_record"),
+                "advanced_score": record.get("advanced_trigger_score"),
+                "advanced_support": record.get("advanced_trigger_support"),
+                "advanced_hits": record.get("advanced_trigger_hits"),
                 "reason": record.get("reason"),
             }
         )
@@ -238,6 +255,9 @@ def normalize_parameter_entries(report: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "season_support": season.get("supports_pick"),
                 "season_pick_record": season.get("pick_team_record"),
                 "season_opp_record": season.get("opponent_record"),
+                "advanced_score": record.get("advanced_trigger_score"),
+                "advanced_support": record.get("advanced_trigger_support"),
+                "advanced_hits": record.get("advanced_trigger_hits"),
                 "reason": "Safer alternate-style version of the spread signal.",
             }
         )
@@ -251,6 +271,7 @@ def aggregate_top_recommendations(entries: List[Dict[str, Any]]) -> List[Dict[st
     public_pct_values: Dict[Tuple[Any, str, str], List[float]] = defaultdict(list)
     season_edge_values: Dict[Tuple[Any, str, str], List[float]] = defaultdict(list)
     season_support_votes: Dict[Tuple[Any, str, str], int] = defaultdict(int)
+    advanced_score_values: Dict[Tuple[Any, str, str], List[float]] = defaultdict(list)
 
     for entry in entries:
         key = (
@@ -274,6 +295,9 @@ def aggregate_top_recommendations(entries: List[Dict[str, Any]]) -> List[Dict[st
             season_support_votes[key] += 1
         elif season_support is False:
             season_support_votes[key] -= 1
+        advanced_score = entry.get("advanced_score")
+        if isinstance(advanced_score, (int, float)):
+            advanced_score_values[key].append(float(advanced_score))
 
     output: List[Dict[str, Any]] = []
     for key, item in grouped.items():
@@ -291,14 +315,25 @@ def aggregate_top_recommendations(entries: List[Dict[str, Any]]) -> List[Dict[st
             season_bonus -= 0.5
         if avg_season_edge is not None:
             season_bonus += max(-0.5, min(0.5, avg_season_edge * 2.0))
+        advanced_values = advanced_score_values[key]
+        avg_advanced_score = (
+            sum(advanced_values) / len(advanced_values) if advanced_values else None
+        )
+        advanced_bonus = 0.0
+        if avg_advanced_score is not None:
+            advanced_bonus += max(-1.0, min(1.0, avg_advanced_score * 0.4))
         item["parameters_triggered"] = params
         item["average_public_pct"] = round(avg_public, 2) if avg_public is not None else None
         item["recommendation_score"] = score
         item["average_season_edge"] = (
             round(avg_season_edge, 4) if avg_season_edge is not None else None
         )
+        item["average_advanced_score"] = (
+            round(avg_advanced_score, 3) if avg_advanced_score is not None else None
+        )
         item["season_bonus"] = round(season_bonus, 3)
-        item["combined_score"] = round(score + season_bonus, 3)
+        item["advanced_bonus"] = round(advanced_bonus, 3)
+        item["combined_score"] = round(score + season_bonus + advanced_bonus, 3)
         output.append(item)
 
     output.sort(
@@ -349,6 +384,24 @@ def render_pick_cards(entries: List[Dict[str, Any]], *, show_score: bool = False
                     record_text = f" | Records: {pick_record} vs {opp_record}"
                 st.caption(f"Season edge: {season_edge} ({season_flag}){record_text}")
 
+            advanced_score = entry.get("advanced_score")
+            if advanced_score is not None:
+                advanced_support = entry.get("advanced_support")
+                advanced_flag = (
+                    "supports pick"
+                    if advanced_support is True
+                    else "against pick"
+                    if advanced_support is False
+                    else "neutral"
+                )
+                st.caption(f"Advanced trigger score: {advanced_score} ({advanced_flag})")
+                hits = entry.get("advanced_hits") or []
+                trigger_labels = [
+                    h.get("label") for h in hits if isinstance(h, dict) and h.get("score")
+                ]
+                if trigger_labels:
+                    st.caption("Trigger hits: " + "; ".join(trigger_labels[:4]))
+
             if show_score:
                 params = entry.get("parameters_triggered") or []
                 if params:
@@ -358,7 +411,8 @@ def render_pick_cards(entries: List[Dict[str, Any]], *, show_score: bool = False
                     st.caption(f"Average public % across triggers: {avg_public}")
                 if entry.get("combined_score") is not None:
                     st.caption(
-                        f"Combined score (params + season bonus): {entry.get('combined_score')}"
+                        "Combined score (params + season + advanced): "
+                        f"{entry.get('combined_score')}"
                     )
 
             reason = entry.get("reason")
@@ -388,9 +442,21 @@ def main() -> None:
 
         with st.expander("Performance", expanded=False):
             fast_mode = st.toggle("Fast mode", value=True)
+            advanced_triggers = st.toggle(
+                "Advanced form triggers",
+                value=True,
+                help=(
+                    "Adds last-10/top-tier/venue/ATS style triggers to pick scoring. "
+                    "Requires deeper game context."
+                ),
+            )
             max_workers = st.slider("Parallel workers", 1, 20, 8, 1)
             request_timeout = st.slider("Request timeout (sec)", 5, 40, 12, 1)
             request_retries = st.slider("Request retries", 1, 5, 2, 1)
+            if advanced_triggers and fast_mode:
+                st.caption(
+                    "Fast mode is auto-overridden when advanced triggers are enabled."
+                )
 
         st.subheader("Refresh")
         auto_refresh = st.toggle("Auto-refresh", value=True)
@@ -424,7 +490,8 @@ def main() -> None:
         "public_metric": public_metric,
         "book_ids": ",".join(str(book_id) for book_id in selected_books),
         "max_workers": int(max_workers),
-        "skip_detail_context": bool(fast_mode),
+        "include_advanced_triggers": bool(advanced_triggers),
+        "skip_detail_context": bool(fast_mode and not advanced_triggers),
         "request_timeout": int(request_timeout),
         "request_retries": int(request_retries),
     }
@@ -490,11 +557,15 @@ def main() -> None:
     m4.metric("Parameter 3 picks", p3_count)
 
     st.caption(
-        "Generated: {generated} | Metric: {metric} | Threshold: {threshold}% | Books: {books}".format(
+        "Generated: {generated} | Metric: {metric} | Threshold: {threshold}% | "
+        "Books: {books} | Advanced triggers: {advanced}".format(
             generated=metadata.get("generated_at_utc", "unknown"),
             metric=metadata.get("public_metric", "unknown"),
             threshold=metadata.get("public_threshold_pct", "unknown"),
             books=", ".join(str(x) for x in metadata.get("preferred_book_ids", [])),
+            advanced=(
+                "on" if metadata.get("include_advanced_triggers", False) else "off"
+            ),
         )
     )
 

@@ -82,6 +82,11 @@ Dashboard features:
 - team seed display when available from feed
 - matchup filter
 - auto-refresh interval control (for frequent checks as lines/games update)
+- optional advanced trigger pack:
+  - last-10 form gap
+  - top-25 / over-.500 proxy
+  - venue split edge (home/road)
+  - ATS last-10 momentum
 
 If loads feel slow, turn on **Fast mode** in the sidebar (skips per-game detail context for quicker refreshes).
 

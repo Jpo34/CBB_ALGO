@@ -834,6 +834,302 @@ def total_pick_model_alignment(
     }
 
 
+def get_record_entry(
+    detail_context: Dict[str, Any], side: str, record_type: str
+) -> Optional[Dict[str, Any]]:
+    situational = detail_context.get("situational") or {}
+    side_data = situational.get(side) or {}
+    records = side_data.get("records") or []
+    for record in records:
+        if record.get("record_type") == record_type:
+            return record
+    return None
+
+
+def record_games_count(record: Optional[Dict[str, Any]]) -> int:
+    if not record:
+        return 0
+    wins = int(safe_float(record.get("wins"), 0.0))
+    losses = int(safe_float(record.get("losses"), 0.0))
+    return wins + losses
+
+
+def record_win_pct(record: Optional[Dict[str, Any]], fallback: float = 0.5) -> float:
+    if not record:
+        return fallback
+    return safe_float(record.get("win_pct"), fallback)
+
+
+def evaluate_diff_trigger(
+    *,
+    name: str,
+    diff: Optional[float],
+    threshold: float,
+    label_positive: str,
+    label_negative: str,
+) -> Dict[str, Any]:
+    if diff is None:
+        return {
+            "name": name,
+            "score": 0,
+            "diff": None,
+            "threshold": threshold,
+            "status": "no_data",
+            "label": "insufficient data",
+        }
+    if diff >= threshold:
+        return {
+            "name": name,
+            "score": 1,
+            "diff": round(diff, 4),
+            "threshold": threshold,
+            "status": "support",
+            "label": label_positive,
+        }
+    if diff <= -threshold:
+        return {
+            "name": name,
+            "score": -1,
+            "diff": round(diff, 4),
+            "threshold": threshold,
+            "status": "oppose",
+            "label": label_negative,
+        }
+    return {
+        "name": name,
+        "score": 0,
+        "diff": round(diff, 4),
+        "threshold": threshold,
+        "status": "neutral",
+        "label": "neutral",
+    }
+
+
+def advanced_triggers_for_side_pick(
+    detail_context: Dict[str, Any],
+    *,
+    pick_side: str,
+    args: argparse.Namespace,
+) -> Dict[str, Any]:
+    if pick_side not in ("home", "away"):
+        return {"score": 0, "supports_pick": None, "hits": [], "has_context": False}
+    if not detail_context:
+        return {"score": 0, "supports_pick": None, "hits": [], "has_context": False}
+
+    opp_side = "away" if pick_side == "home" else "home"
+    hits: List[Dict[str, Any]] = []
+
+    pick_last10 = record_win_pct(get_record_entry(detail_context, pick_side, "last_10"))
+    opp_last10 = record_win_pct(get_record_entry(detail_context, opp_side, "last_10"))
+    hits.append(
+        evaluate_diff_trigger(
+            name="last_10_form_gap",
+            diff=pick_last10 - opp_last10,
+            threshold=args.trigger_last10_threshold,
+            label_positive="Pick side stronger in last 10 games",
+            label_negative="Pick side weaker in last 10 games",
+        )
+    )
+
+    pick_top25 = get_record_entry(detail_context, pick_side, "top_25")
+    opp_top25 = get_record_entry(detail_context, opp_side, "top_25")
+    diff_top: Optional[float] = None
+    source_name = "top_25"
+    if (
+        record_games_count(pick_top25) >= args.trigger_top25_min_games
+        and record_games_count(opp_top25) >= args.trigger_top25_min_games
+    ):
+        diff_top = record_win_pct(pick_top25) - record_win_pct(opp_top25)
+    else:
+        pick_over500 = get_record_entry(detail_context, pick_side, "over_500")
+        opp_over500 = get_record_entry(detail_context, opp_side, "over_500")
+        if (
+            record_games_count(pick_over500) >= args.trigger_over500_min_games
+            and record_games_count(opp_over500) >= args.trigger_over500_min_games
+        ):
+            diff_top = record_win_pct(pick_over500) - record_win_pct(opp_over500)
+            source_name = "over_500"
+    top_hit = evaluate_diff_trigger(
+        name="top_tier_resistance",
+        diff=diff_top,
+        threshold=args.trigger_top_tier_threshold,
+        label_positive=f"Pick side stronger vs tougher opponents ({source_name})",
+        label_negative=f"Pick side weaker vs tougher opponents ({source_name})",
+    )
+    top_hit["source"] = source_name
+    hits.append(top_hit)
+
+    if pick_side == "home":
+        pick_venue = record_win_pct(get_record_entry(detail_context, "home", "home"))
+        opp_venue = record_win_pct(get_record_entry(detail_context, "away", "road"))
+    else:
+        pick_venue = record_win_pct(get_record_entry(detail_context, "away", "road"))
+        opp_venue = record_win_pct(get_record_entry(detail_context, "home", "home"))
+    hits.append(
+        evaluate_diff_trigger(
+            name="venue_split_edge",
+            diff=pick_venue - opp_venue,
+            threshold=args.trigger_venue_threshold,
+            label_positive="Venue split supports pick side",
+            label_negative="Venue split opposes pick side",
+        )
+    )
+
+    pick_ats = record_win_pct(get_record_entry(detail_context, pick_side, "ats_last_10"))
+    opp_ats = record_win_pct(get_record_entry(detail_context, opp_side, "ats_last_10"))
+    hits.append(
+        evaluate_diff_trigger(
+            name="ats_momentum",
+            diff=pick_ats - opp_ats,
+            threshold=args.trigger_ats_threshold,
+            label_positive="Pick side has stronger ATS momentum",
+            label_negative="Pick side has weaker ATS momentum",
+        )
+    )
+
+    score = int(sum(hit.get("score", 0) for hit in hits))
+    return {
+        "score": score,
+        "supports_pick": bool(score > 0),
+        "hits": hits,
+        "has_context": True,
+    }
+
+
+def advanced_triggers_for_total_pick(
+    detail_context: Dict[str, Any],
+    *,
+    pick_side: str,
+    args: argparse.Namespace,
+) -> Dict[str, Any]:
+    if pick_side not in ("over", "under"):
+        return {"score": 0, "supports_pick": None, "hits": [], "has_context": False}
+    if not detail_context:
+        return {"score": 0, "supports_pick": None, "hits": [], "has_context": False}
+
+    home_ou = record_win_pct(get_record_entry(detail_context, "home", "over_under_last_10"))
+    away_ou = record_win_pct(get_record_entry(detail_context, "away", "over_under_last_10"))
+    avg_ou = (home_ou + away_ou) / 2.0
+    if pick_side == "over":
+        diff = avg_ou - 0.5
+        positive = "Recent totals trend leans over"
+        negative = "Recent totals trend leans under"
+    else:
+        diff = 0.5 - avg_ou
+        positive = "Recent totals trend leans under"
+        negative = "Recent totals trend leans over"
+
+    hit = evaluate_diff_trigger(
+        name="totals_recent_trend",
+        diff=diff,
+        threshold=args.trigger_total_trend_threshold,
+        label_positive=positive,
+        label_negative=negative,
+    )
+    score = int(hit.get("score", 0))
+    return {
+        "score": score,
+        "supports_pick": bool(score > 0),
+        "hits": [hit],
+        "has_context": True,
+    }
+
+
+def attach_advanced_triggers(
+    *,
+    args: argparse.Namespace,
+    session: requests.Session,
+    game_links: Dict[int, str],
+    parameter_1: List[Dict[str, Any]],
+    parameter_2_spread: List[Dict[str, Any]],
+    parameter_2_total: List[Dict[str, Any]],
+    parameter_3: List[Dict[str, Any]],
+) -> None:
+    if not args.include_advanced_triggers or args.skip_detail_context:
+        return
+
+    target_game_ids = {
+        int(record["game_id"])
+        for record in (parameter_1 + parameter_2_spread + parameter_2_total + parameter_3)
+        if record.get("game_id") is not None
+    }
+    if not target_game_ids:
+        return
+
+    detail_contexts: Dict[int, Dict[str, Any]] = {}
+    worker_count = max(1, min(args.max_workers, len(target_game_ids)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
+        future_map = {}
+        for game_id in target_game_ids:
+            game_url = game_links.get(game_id)
+            if not game_url:
+                continue
+            future_map[
+                executor.submit(
+                    fetch_game_detail_context,
+                    session,
+                    game_id,
+                    game_url,
+                    request_timeout=args.request_timeout,
+                    request_retries=args.request_retries,
+                )
+            ] = game_id
+        for future in concurrent.futures.as_completed(future_map):
+            game_id = future_map[future]
+            try:
+                detail_contexts[game_id] = future.result()
+            except Exception:  # pragma: no cover - network dependent
+                detail_contexts[game_id] = {}
+
+    for record in parameter_1:
+        game_id = int(record["game_id"])
+        pick_side = (record.get("recommended_pick") or {}).get("side")
+        result = advanced_triggers_for_side_pick(
+            detail_contexts.get(game_id, {}),
+            pick_side=pick_side,
+            args=args,
+        )
+        record["advanced_trigger_score"] = result["score"]
+        record["advanced_trigger_support"] = result["supports_pick"]
+        record["advanced_trigger_hits"] = result["hits"]
+
+    for record in parameter_2_spread:
+        game_id = int(record["game_id"])
+        pick_side = (record.get("recommended_pick") or {}).get("side")
+        result = advanced_triggers_for_side_pick(
+            detail_contexts.get(game_id, {}),
+            pick_side=pick_side,
+            args=args,
+        )
+        record["advanced_trigger_score"] = result["score"]
+        record["advanced_trigger_support"] = result["supports_pick"]
+        record["advanced_trigger_hits"] = result["hits"]
+
+    for record in parameter_2_total:
+        game_id = int(record["game_id"])
+        pick_side = (record.get("recommended_pick") or {}).get("side")
+        result = advanced_triggers_for_total_pick(
+            detail_contexts.get(game_id, {}),
+            pick_side=pick_side,
+            args=args,
+        )
+        record["advanced_trigger_score"] = result["score"]
+        record["advanced_trigger_support"] = result["supports_pick"]
+        record["advanced_trigger_hits"] = result["hits"]
+
+    for record in parameter_3:
+        game_id = int(record["game_id"])
+        pick_side = (record.get("base_pick") or {}).get("side")
+        result = advanced_triggers_for_side_pick(
+            detail_contexts.get(game_id, {}),
+            pick_side=pick_side,
+            args=args,
+        )
+        record["advanced_trigger_score"] = result["score"]
+        record["advanced_trigger_support"] = result["supports_pick"]
+        record["advanced_trigger_hits"] = result["hits"]
+
+
 def get_book_name(book_meta: Dict[str, Any]) -> str:
     return (
         book_meta.get("parent_name")
@@ -1266,6 +1562,7 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
     )
     preferred_book_ids = [int(x) for x in args.book_ids.split(",") if x.strip()]
     include_model = bool(args.include_model)
+    include_advanced_triggers = bool(args.include_advanced_triggers)
 
     histories: Dict[int, Dict[str, Any]] = {}
     detail_contexts: Dict[int, Dict[str, Any]] = {}
@@ -1637,6 +1934,16 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
                         fade_side,
                     )
 
+    attach_advanced_triggers(
+        args=args,
+        session=session,
+        game_links=game_links,
+        parameter_1=parameter_1,
+        parameter_2_spread=parameter_2_spread,
+        parameter_2_total=parameter_2_total,
+        parameter_3=parameter_3,
+    )
+
     return {
         "metadata": {
             "generated_at_utc": utc_now_iso(),
@@ -1648,6 +1955,7 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
             "request_timeout_seconds": args.request_timeout,
             "request_retries": args.request_retries,
             "include_model": include_model,
+            "include_advanced_triggers": include_advanced_triggers,
             "compact_output": bool(args.compact_output),
             "preferred_book_ids": preferred_book_ids,
             "preferred_sportsbooks": [
@@ -1665,6 +1973,11 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
                 "Line release date is taken from the earliest 'opener' timestamp in market history.",
                 "Parameter 3 attempts explicit alternate spread odds first; if unavailable in feed, it falls back to a safer moneyline proxy.",
                 "Season context (record/win%) is attached to spread and moneyline-style picks.",
+                (
+                    "Advanced trigger pack uses last_10, top_25/over_500 proxy, venue split, and ATS momentum."
+                    if include_advanced_triggers
+                    else "Advanced trigger pack disabled."
+                ),
                 (
                     "Model projections use trend and injury context from each game detail page."
                     if include_model
@@ -1733,6 +2046,12 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
         help="Enable model projection payload and model alignment fields (default: on).",
     )
     parser.add_argument(
+        "--include-advanced-triggers",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable advanced trend triggers (last10/top-tier/venue/ATS) for pick scoring.",
+    )
+    parser.add_argument(
         "--compact-output",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -1781,6 +2100,48 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
         type=int,
         default=-225,
         help="Parameter 3 odds midpoint target (default: -225).",
+    )
+    parser.add_argument(
+        "--trigger-last10-threshold",
+        type=float,
+        default=0.15,
+        help="Win%% gap threshold for last-10 trigger (default: 0.15).",
+    )
+    parser.add_argument(
+        "--trigger-top-tier-threshold",
+        type=float,
+        default=0.1,
+        help="Win%% gap threshold for top-tier proxy trigger (default: 0.10).",
+    )
+    parser.add_argument(
+        "--trigger-venue-threshold",
+        type=float,
+        default=0.12,
+        help="Win%% gap threshold for venue split trigger (default: 0.12).",
+    )
+    parser.add_argument(
+        "--trigger-ats-threshold",
+        type=float,
+        default=0.15,
+        help="Win%% gap threshold for ATS momentum trigger (default: 0.15).",
+    )
+    parser.add_argument(
+        "--trigger-total-trend-threshold",
+        type=float,
+        default=0.08,
+        help="Deviation threshold for total trend trigger (default: 0.08).",
+    )
+    parser.add_argument(
+        "--trigger-top25-min-games",
+        type=int,
+        default=2,
+        help="Minimum games needed for top_25 record comparison (default: 2).",
+    )
+    parser.add_argument(
+        "--trigger-over500-min-games",
+        type=int,
+        default=4,
+        help="Minimum games needed for over_500 fallback comparison (default: 4).",
     )
     parser.add_argument(
         "--output",
