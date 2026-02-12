@@ -97,6 +97,13 @@ def standings_win_pct(team: Dict[str, Any]) -> float:
     return wins / total
 
 
+def team_record_string(team: Dict[str, Any]) -> str:
+    standings = team.get("standings") or {}
+    wins = int(safe_float(standings.get("win"), 0.0))
+    losses = int(safe_float(standings.get("loss"), 0.0))
+    return f"{wins}-{losses}"
+
+
 def extract_team_seed(team: Dict[str, Any]) -> Optional[Any]:
     direct_keys = ("seed", "tournament_seed", "ap_rank", "rank", "coaches_rank")
     for key in direct_keys:
@@ -110,6 +117,63 @@ def extract_team_seed(team: Dict[str, Any]) -> Optional[Any]:
         if value not in (None, "", 0):
             return value
     return None
+
+
+def build_season_context(teams: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    home = teams["home"]
+    away = teams["away"]
+    home_win_pct = standings_win_pct(home)
+    away_win_pct = standings_win_pct(away)
+    return {
+        "home": {
+            "team": home.get("display_name"),
+            "record": team_record_string(home),
+            "win_pct": round(home_win_pct, 4),
+            "seed": extract_team_seed(home),
+        },
+        "away": {
+            "team": away.get("display_name"),
+            "record": team_record_string(away),
+            "win_pct": round(away_win_pct, 4),
+            "seed": extract_team_seed(away),
+        },
+    }
+
+
+def season_alignment_for_pick_side(
+    pick_side: str, season_context: Dict[str, Any]
+) -> Optional[Dict[str, Any]]:
+    if pick_side not in ("home", "away"):
+        return None
+    opponent_side = "away" if pick_side == "home" else "home"
+    pick_data = season_context.get(pick_side) or {}
+    opp_data = season_context.get(opponent_side) or {}
+    pick_win_pct = safe_float(pick_data.get("win_pct"), 0.5)
+    opp_win_pct = safe_float(opp_data.get("win_pct"), 0.5)
+    edge = pick_win_pct - opp_win_pct
+    return {
+        "pick_team_record": pick_data.get("record"),
+        "pick_team_win_pct": round(pick_win_pct, 4),
+        "opponent_record": opp_data.get("record"),
+        "opponent_win_pct": round(opp_win_pct, 4),
+        "season_edge": round(edge, 4),
+        "supports_pick": bool(edge >= 0.0),
+    }
+
+
+def season_context_for_total(
+    season_context: Dict[str, Any], pick_side: str
+) -> Dict[str, Any]:
+    home_win_pct = safe_float((season_context.get("home") or {}).get("win_pct"), 0.5)
+    away_win_pct = safe_float((season_context.get("away") or {}).get("win_pct"), 0.5)
+    return {
+        "pick_side": pick_side,
+        "home_record": (season_context.get("home") or {}).get("record"),
+        "away_record": (season_context.get("away") or {}).get("record"),
+        "home_win_pct": round(home_win_pct, 4),
+        "away_win_pct": round(away_win_pct, 4),
+        "combined_win_pct": round((home_win_pct + away_win_pct) / 2.0, 4),
+    }
 
 
 def find_record_win_pct(
@@ -1173,6 +1237,7 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
         home_team_name = teams["home"]["display_name"]
         away_seed = extract_team_seed(teams["away"])
         home_seed = extract_team_seed(teams["home"])
+        season_context = build_season_context(teams)
 
         analysis_book = pick_analysis_book(history_data, preferred_book_ids)
         matchup = f"{away_team_name} @ {home_team_name}"
@@ -1282,6 +1347,10 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
                             "line": fade_line,
                             "odds": fade_odds,
                         },
+                        "season_alignment": season_alignment_for_pick_side(
+                            fade_side,
+                            season_context,
+                        ),
                         "reason": (
                             f"Public is {spread_summary['heavy_public_pct']:.1f}% on "
                             f"{spread_summary['heavy_public_team']} but line did not move "
@@ -1333,6 +1402,10 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
                             "line": fade_line,
                             "odds": fade_odds,
                         },
+                        "season_alignment": season_alignment_for_pick_side(
+                            fade_side,
+                            season_context,
+                        ),
                         "reason": (
                             "Public side and spread movement are in conflict "
                             "(reverse line movement signal)."
@@ -1390,6 +1463,10 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
                             "line": fade_line,
                             "odds": fade_odds,
                         },
+                        "season_alignment": season_alignment_for_pick_side(
+                            fade_side,
+                            season_context,
+                        ),
                         "safer_alternate_pick": alt_pick,
                         "target_odds_window": {
                             "min": args.alt_target_low,
@@ -1439,6 +1516,10 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
                             "line": fade_line,
                             "odds": fade_odds,
                         },
+                        "season_context": season_context_for_total(
+                            season_context,
+                            fade_side,
+                        ),
                         "reason": (
                             "Public total side and total movement are in conflict "
                             "(reverse line movement signal)."
@@ -1478,6 +1559,7 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
             "notes": [
                 "Line release date is taken from the earliest 'opener' timestamp in market history.",
                 "Parameter 3 attempts explicit alternate spread odds first; if unavailable in feed, it falls back to a safer moneyline proxy.",
+                "Season context (record/win%) is attached to spread and moneyline-style picks.",
                 (
                     "Model projections use trend and injury context from each game detail page."
                     if include_model

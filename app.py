@@ -90,6 +90,7 @@ def normalize_parameter_entries(report: Dict[str, Any]) -> List[Dict[str, Any]]:
 
     for record in report.get("parameter_1", []):
         pick = record.get("recommended_pick") or {}
+        season = record.get("season_alignment") or {}
         team = pick.get("team") or ""
         line = pick.get("line")
         odds = pick.get("odds")
@@ -108,12 +109,17 @@ def normalize_parameter_entries(report: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "pick_text": pick_text,
                 "sportsbook": record.get("sportsbook"),
                 "public_pct": record.get("public_pct"),
+                "season_edge": season.get("season_edge"),
+                "season_support": season.get("supports_pick"),
+                "season_pick_record": season.get("pick_team_record"),
+                "season_opp_record": season.get("opponent_record"),
                 "reason": record.get("reason"),
             }
         )
 
     for record in report.get("parameter_2", {}).get("spread", []):
         pick = record.get("recommended_pick") or {}
+        season = record.get("season_alignment") or {}
         team = pick.get("team") or ""
         line = pick.get("line")
         odds = pick.get("odds")
@@ -132,12 +138,17 @@ def normalize_parameter_entries(report: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "pick_text": pick_text,
                 "sportsbook": record.get("sportsbook"),
                 "public_pct": record.get("public_pct"),
+                "season_edge": season.get("season_edge"),
+                "season_support": season.get("supports_pick"),
+                "season_pick_record": season.get("pick_team_record"),
+                "season_opp_record": season.get("opponent_record"),
                 "reason": record.get("reason"),
             }
         )
 
     for record in report.get("parameter_2", {}).get("totals", []):
         pick = record.get("recommended_pick") or {}
+        season = record.get("season_context") or {}
         side = str(pick.get("side") or "").title()
         line = pick.get("line")
         odds = pick.get("odds")
@@ -156,6 +167,10 @@ def normalize_parameter_entries(report: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "pick_text": pick_text,
                 "sportsbook": record.get("sportsbook"),
                 "public_pct": record.get("public_pct"),
+                "season_edge": None,
+                "season_support": None,
+                "season_pick_record": season.get("home_record"),
+                "season_opp_record": season.get("away_record"),
                 "reason": record.get("reason"),
             }
         )
@@ -163,6 +178,7 @@ def normalize_parameter_entries(report: Dict[str, Any]) -> List[Dict[str, Any]]:
     for record in report.get("parameter_3", []):
         safer = record.get("safer_alternate_pick") or {}
         base_pick = record.get("base_pick") or {}
+        season = record.get("season_alignment") or {}
         team = base_pick.get("team") or ""
         sportsbook = safer.get("sportsbook") or record.get("analysis_sportsbook")
 
@@ -200,6 +216,10 @@ def normalize_parameter_entries(report: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "pick_text": pick_text,
                 "sportsbook": sportsbook,
                 "public_pct": trigger.get("public_pct"),
+                "season_edge": season.get("season_edge"),
+                "season_support": season.get("supports_pick"),
+                "season_pick_record": season.get("pick_team_record"),
+                "season_opp_record": season.get("opponent_record"),
                 "reason": "Safer alternate-style version of the spread signal.",
             }
         )
@@ -211,6 +231,8 @@ def aggregate_top_recommendations(entries: List[Dict[str, Any]]) -> List[Dict[st
     grouped: Dict[Tuple[Any, str, str], Dict[str, Any]] = {}
     param_sets: Dict[Tuple[Any, str, str], set] = defaultdict(set)
     public_pct_values: Dict[Tuple[Any, str, str], List[float]] = defaultdict(list)
+    season_edge_values: Dict[Tuple[Any, str, str], List[float]] = defaultdict(list)
+    season_support_votes: Dict[Tuple[Any, str, str], int] = defaultdict(int)
 
     for entry in entries:
         key = (
@@ -226,6 +248,14 @@ def aggregate_top_recommendations(entries: List[Dict[str, Any]]) -> List[Dict[st
         public_pct = entry.get("public_pct")
         if isinstance(public_pct, (int, float)):
             public_pct_values[key].append(float(public_pct))
+        season_edge = entry.get("season_edge")
+        if isinstance(season_edge, (int, float)):
+            season_edge_values[key].append(float(season_edge))
+        season_support = entry.get("season_support")
+        if season_support is True:
+            season_support_votes[key] += 1
+        elif season_support is False:
+            season_support_votes[key] -= 1
 
     output: List[Dict[str, Any]] = []
     for key, item in grouped.items():
@@ -233,13 +263,29 @@ def aggregate_top_recommendations(entries: List[Dict[str, Any]]) -> List[Dict[st
         params = sorted(p for p in param_sets[key] if p)
         public_values = public_pct_values[key]
         avg_public = sum(public_values) / len(public_values) if public_values else None
+        season_values = season_edge_values[key]
+        avg_season_edge = sum(season_values) / len(season_values) if season_values else None
+        support_vote = season_support_votes[key]
+        season_bonus = 0.0
+        if support_vote > 0:
+            season_bonus += 0.5
+        elif support_vote < 0:
+            season_bonus -= 0.5
+        if avg_season_edge is not None:
+            season_bonus += max(-0.5, min(0.5, avg_season_edge * 2.0))
         item["parameters_triggered"] = params
         item["average_public_pct"] = round(avg_public, 2) if avg_public is not None else None
         item["recommendation_score"] = score
+        item["average_season_edge"] = (
+            round(avg_season_edge, 4) if avg_season_edge is not None else None
+        )
+        item["season_bonus"] = round(season_bonus, 3)
+        item["combined_score"] = round(score + season_bonus, 3)
         output.append(item)
 
     output.sort(
         key=lambda x: (
+            -float(x.get("combined_score", x.get("recommendation_score", 0))),
             -int(x.get("recommendation_score", 0)),
             -(float(x.get("average_public_pct")) if x.get("average_public_pct") is not None else -1),
             str(x.get("matchup", "")),
@@ -274,6 +320,17 @@ def render_pick_cards(entries: List[Dict[str, Any]], *, show_score: bool = False
             meta = " • ".join(part for part in line_parts if part)
             st.caption(meta)
 
+            season_edge = entry.get("season_edge")
+            if season_edge is not None:
+                season_support = entry.get("season_support")
+                season_flag = "supports pick" if season_support else "against pick"
+                pick_record = entry.get("season_pick_record")
+                opp_record = entry.get("season_opp_record")
+                record_text = ""
+                if pick_record and opp_record:
+                    record_text = f" | Records: {pick_record} vs {opp_record}"
+                st.caption(f"Season edge: {season_edge} ({season_flag}){record_text}")
+
             if show_score:
                 params = entry.get("parameters_triggered") or []
                 if params:
@@ -281,6 +338,10 @@ def render_pick_cards(entries: List[Dict[str, Any]], *, show_score: bool = False
                 avg_public = entry.get("average_public_pct")
                 if avg_public is not None:
                     st.caption(f"Average public % across triggers: {avg_public}")
+                if entry.get("combined_score") is not None:
+                    st.caption(
+                        f"Combined score (params + season bonus): {entry.get('combined_score')}"
+                    )
 
             reason = entry.get("reason")
             if reason:
