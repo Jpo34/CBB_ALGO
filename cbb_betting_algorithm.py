@@ -97,6 +97,21 @@ def standings_win_pct(team: Dict[str, Any]) -> float:
     return wins / total
 
 
+def extract_team_seed(team: Dict[str, Any]) -> Optional[Any]:
+    direct_keys = ("seed", "tournament_seed", "ap_rank", "rank", "coaches_rank")
+    for key in direct_keys:
+        value = team.get(key)
+        if value not in (None, "", 0):
+            return value
+
+    standings = team.get("standings") or {}
+    for key in direct_keys:
+        value = standings.get(key)
+        if value not in (None, "", 0):
+            return value
+    return None
+
+
 def find_record_win_pct(
     records: List[Dict[str, Any]], record_type: str, fallback: float
 ) -> float:
@@ -1004,57 +1019,64 @@ def build_game_snapshot(
     history_data: Dict[str, Any],
     all_books: Dict[str, Dict[str, Any]],
     preferred_book_ids: List[int],
+    *,
+    include_books: bool,
 ) -> Dict[str, Any]:
     teams = get_teams(game)
     books_snapshot: List[Dict[str, Any]] = []
-    for book_id in preferred_book_ids:
-        key = str(book_id)
-        event = history_data.get(key, {}).get("event", {})
-        if not event:
-            continue
+    if include_books:
+        for book_id in preferred_book_ids:
+            key = str(book_id)
+            event = history_data.get(key, {}).get("event", {})
+            if not event:
+                continue
 
-        spread_summary = spread_movement_summary(
-            event, teams, public_metric="money", threshold=0.0
-        )
-        total_summary = total_movement_summary(
-            event, public_metric="money", threshold=0.0
-        )
-        moneyline = event.get("moneyline") or []
-        moneyline_side = by_side(moneyline)
-        books_snapshot.append(
-            {
-                "book_id": book_id,
-                "sportsbook": get_book_name(all_books.get(key, {})),
-                "spread": spread_summary["lines"] if spread_summary else None,
-                "spread_release_utc": spread_summary["release_utc"]
-                if spread_summary
-                else None,
-                "spread_last_update_utc": spread_summary["last_update_utc"]
-                if spread_summary
-                else None,
-                "total": total_summary["lines"] if total_summary else None,
-                "total_release_utc": total_summary["release_utc"]
-                if total_summary
-                else None,
-                "total_last_update_utc": total_summary["last_update_utc"]
-                if total_summary
-                else None,
-                "moneyline": {
-                    side: {
-                        "odds": outcome.get("odds"),
-                        "public_tickets_pct": get_public_percent(outcome, "tickets"),
-                        "public_money_pct": get_public_percent(outcome, "money"),
-                    }
-                    for side, outcome in moneyline_side.items()
-                },
-            }
-        )
+            spread_summary = spread_movement_summary(
+                event, teams, public_metric="money", threshold=0.0
+            )
+            total_summary = total_movement_summary(
+                event, public_metric="money", threshold=0.0
+            )
+            moneyline = event.get("moneyline") or []
+            moneyline_side = by_side(moneyline)
+            books_snapshot.append(
+                {
+                    "book_id": book_id,
+                    "sportsbook": get_book_name(all_books.get(key, {})),
+                    "spread": spread_summary["lines"] if spread_summary else None,
+                    "spread_release_utc": spread_summary["release_utc"]
+                    if spread_summary
+                    else None,
+                    "spread_last_update_utc": spread_summary["last_update_utc"]
+                    if spread_summary
+                    else None,
+                    "total": total_summary["lines"] if total_summary else None,
+                    "total_release_utc": total_summary["release_utc"]
+                    if total_summary
+                    else None,
+                    "total_last_update_utc": total_summary["last_update_utc"]
+                    if total_summary
+                    else None,
+                    "moneyline": {
+                        side: {
+                            "odds": outcome.get("odds"),
+                            "public_tickets_pct": get_public_percent(outcome, "tickets"),
+                            "public_money_pct": get_public_percent(outcome, "money"),
+                        }
+                        for side, outcome in moneyline_side.items()
+                    },
+                }
+            )
 
     away = teams["away"]["display_name"]
     home = teams["home"]["display_name"]
     return {
         "game_id": game["id"],
         "matchup": f"{away} @ {home}",
+        "away_team": away,
+        "home_team": home,
+        "away_seed": extract_team_seed(teams["away"]),
+        "home_seed": extract_team_seed(teams["home"]),
         "start_time_utc": game.get("start_time"),
         "num_bets": game.get("num_bets"),
         "books": books_snapshot,
@@ -1071,6 +1093,7 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
         request_retries=args.request_retries,
     )
     preferred_book_ids = [int(x) for x in args.book_ids.split(",") if x.strip()]
+    include_model = bool(args.include_model)
 
     histories: Dict[int, Dict[str, Any]] = {}
     detail_contexts: Dict[int, Dict[str, Any]] = {}
@@ -1090,7 +1113,7 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
             ] = ("history", game_id)
 
             game_url = game_links.get(game_id)
-            if game_url and not args.skip_detail_context:
+            if game_url and include_model and not args.skip_detail_context:
                 future_map[
                     executor.submit(
                         fetch_game_detail_context,
@@ -1138,20 +1161,18 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
                 history_data=history_data,
                 all_books=all_books,
                 preferred_book_ids=preferred_book_ids,
+                include_books=not args.compact_output,
             )
         )
 
         teams = get_teams(game)
-        detail_context = detail_contexts.get(game_id) or {}
-        model_projection = build_model_projection(
-            game=game,
-            teams=teams,
-            detail_context=detail_context,
-            home_court_advantage=args.home_court_advantage,
-        )
+        away_team_name = teams["away"]["display_name"]
+        home_team_name = teams["home"]["display_name"]
+        away_seed = extract_team_seed(teams["away"])
+        home_seed = extract_team_seed(teams["home"])
 
         analysis_book = pick_analysis_book(history_data, preferred_book_ids)
-        matchup = f"{teams['away']['display_name']} @ {teams['home']['display_name']}"
+        matchup = f"{away_team_name} @ {home_team_name}"
         game_url = game_links.get(game_id)
         sportsbook = (
             get_book_name(all_books.get(analysis_book, {}))
@@ -1178,29 +1199,42 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
             if analysis_book
             else None
         )
-        model_edges = model_market_edges(
-            model_projection=model_projection,
-            spread_summary=spread_summary,
-            total_summary=total_summary,
-            teams=teams,
-        )
+        model_edges: Dict[str, Any] = {}
+        if include_model:
+            detail_context = detail_contexts.get(game_id) or {}
+            model_projection = build_model_projection(
+                game=game,
+                teams=teams,
+                detail_context=detail_context,
+                home_court_advantage=args.home_court_advantage,
+            )
+            model_edges = model_market_edges(
+                model_projection=model_projection,
+                spread_summary=spread_summary,
+                total_summary=total_summary,
+                teams=teams,
+            )
 
-        model_projections.append(
-            {
-                "game_id": game_id,
-                "matchup": matchup,
-                "start_time_utc": game.get("start_time"),
-                "game_url": game_url,
-                "analysis_sportsbook": sportsbook,
-                "analysis_book_id": int(analysis_book) if analysis_book else None,
-                "line_release_utc": spread_summary["release_utc"] if spread_summary else None,
-                "line_last_update_utc": spread_summary["last_update_utc"] if spread_summary else None,
-                "total_release_utc": total_summary["release_utc"] if total_summary else None,
-                "total_last_update_utc": total_summary["last_update_utc"] if total_summary else None,
-                "model_projection": model_projection,
-                "market_edges": model_edges,
-            }
-        )
+            model_projections.append(
+                {
+                    "game_id": game_id,
+                    "matchup": matchup,
+                    "away_team": away_team_name,
+                    "home_team": home_team_name,
+                    "away_seed": away_seed,
+                    "home_seed": home_seed,
+                    "start_time_utc": game.get("start_time"),
+                    "game_url": game_url,
+                    "analysis_sportsbook": sportsbook,
+                    "analysis_book_id": int(analysis_book) if analysis_book else None,
+                    "line_release_utc": spread_summary["release_utc"] if spread_summary else None,
+                    "line_last_update_utc": spread_summary["last_update_utc"] if spread_summary else None,
+                    "total_release_utc": total_summary["release_utc"] if total_summary else None,
+                    "total_last_update_utc": total_summary["last_update_utc"] if total_summary else None,
+                    "model_projection": model_projection,
+                    "market_edges": model_edges,
+                }
+            )
 
         if not analysis_book:
             continue
@@ -1221,6 +1255,10 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
                     {
                         "game_id": game_id,
                         "matchup": matchup,
+                        "away_team": away_team_name,
+                        "home_team": home_team_name,
+                        "away_seed": away_seed,
+                        "home_seed": home_seed,
                         "start_time_utc": game.get("start_time"),
                         "game_url": game_url,
                         "sportsbook": sportsbook,
@@ -1241,10 +1279,6 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
                             "line": fade_line,
                             "odds": fade_odds,
                         },
-                        "model_alignment": spread_pick_model_alignment(
-                            model_edges,
-                            fade_side,
-                        ),
                         "reason": (
                             f"Public is {spread_summary['heavy_public_pct']:.1f}% on "
                             f"{spread_summary['heavy_public_team']} but line did not move "
@@ -1252,6 +1286,11 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
                         ),
                     }
                 )
+                if include_model:
+                    parameter_1[-1]["model_alignment"] = spread_pick_model_alignment(
+                        model_edges,
+                        fade_side,
+                    )
 
         # ----------------------------
         # Parameter 2 (Spread)
@@ -1267,6 +1306,10 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
                     {
                         "game_id": game_id,
                         "matchup": matchup,
+                        "away_team": away_team_name,
+                        "home_team": home_team_name,
+                        "away_seed": away_seed,
+                        "home_seed": home_seed,
                         "start_time_utc": game.get("start_time"),
                         "game_url": game_url,
                         "sportsbook": sportsbook,
@@ -1287,16 +1330,17 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
                             "line": fade_line,
                             "odds": fade_odds,
                         },
-                        "model_alignment": spread_pick_model_alignment(
-                            model_edges,
-                            fade_side,
-                        ),
                         "reason": (
                             "Public side and spread movement are in conflict "
                             "(reverse line movement signal)."
                         ),
                     }
                 )
+                if include_model:
+                    parameter_2_spread[-1]["model_alignment"] = spread_pick_model_alignment(
+                        model_edges,
+                        fade_side,
+                    )
 
                 # ----------------------------
                 # Parameter 3
@@ -1317,6 +1361,10 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
                     {
                         "game_id": game_id,
                         "matchup": matchup,
+                        "away_team": away_team_name,
+                        "home_team": home_team_name,
+                        "away_seed": away_seed,
+                        "home_seed": home_seed,
                         "start_time_utc": game.get("start_time"),
                         "game_url": game_url,
                         "analysis_sportsbook": sportsbook,
@@ -1340,10 +1388,6 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
                             "odds": fade_odds,
                         },
                         "safer_alternate_pick": alt_pick,
-                        "model_alignment": spread_pick_model_alignment(
-                            model_edges,
-                            fade_side,
-                        ),
                         "target_odds_window": {
                             "min": args.alt_target_low,
                             "max": args.alt_target_high,
@@ -1351,6 +1395,11 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
                         },
                     }
                 )
+                if include_model:
+                    parameter_3[-1]["model_alignment"] = spread_pick_model_alignment(
+                        model_edges,
+                        fade_side,
+                    )
 
         # ----------------------------
         # Parameter 2 (Totals)
@@ -1365,6 +1414,10 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
                     {
                         "game_id": game_id,
                         "matchup": matchup,
+                        "away_team": away_team_name,
+                        "home_team": home_team_name,
+                        "away_seed": away_seed,
+                        "home_seed": home_seed,
                         "start_time_utc": game.get("start_time"),
                         "game_url": game_url,
                         "sportsbook": sportsbook,
@@ -1383,16 +1436,17 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
                             "line": fade_line,
                             "odds": fade_odds,
                         },
-                        "model_alignment": total_pick_model_alignment(
-                            model_edges,
-                            fade_side,
-                        ),
                         "reason": (
                             "Public total side and total movement are in conflict "
                             "(reverse line movement signal)."
                         ),
                     }
                 )
+                if include_model:
+                    parameter_2_total[-1]["model_alignment"] = total_pick_model_alignment(
+                        model_edges,
+                        fade_side,
+                    )
 
     return {
         "metadata": {
@@ -1404,6 +1458,8 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
             "detail_context_enabled": not args.skip_detail_context,
             "request_timeout_seconds": args.request_timeout,
             "request_retries": args.request_retries,
+            "include_model": include_model,
+            "compact_output": bool(args.compact_output),
             "preferred_book_ids": preferred_book_ids,
             "preferred_sportsbooks": [
                 {
@@ -1419,7 +1475,11 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
             "notes": [
                 "Line release date is taken from the earliest 'opener' timestamp in market history.",
                 "Parameter 3 attempts explicit alternate spread odds first; if unavailable in feed, it falls back to a safer moneyline proxy.",
-                "Model projections use trend and injury context from each game detail page.",
+                (
+                    "Model projections use trend and injury context from each game detail page."
+                    if include_model
+                    else "Model projections disabled for compact output mode."
+                ),
             ],
         },
         "all_games_snapshot": all_games_snapshot,
@@ -1470,6 +1530,18 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
         type=int,
         default=10,
         help="Max worker threads for per-game history calls (default: 10).",
+    )
+    parser.add_argument(
+        "--include-model",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable model projection payload and model alignment fields (default: on).",
+    )
+    parser.add_argument(
+        "--compact-output",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Reduce report size by omitting per-book snapshot details (default: off).",
     )
     parser.add_argument(
         "--skip-detail-context",

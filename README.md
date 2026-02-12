@@ -72,10 +72,15 @@ python3 -m streamlit run app.py
 ```
 
 Dashboard features:
-- tabs for Parameters 1/2/3, model projections, and raw JSON
-- filters by matchup text
-- optional "model-supported only" picks
-- minimum model-edge filter
+- tabs for:
+  - Top Recommended Bets (descending)
+  - Parameter 1
+  - Parameter 2
+  - Parameter 3
+  - All Picks
+- game cards with matchup + recommended pick text
+- team seed display when available from feed
+- matchup filter
 - auto-refresh interval control (for frequent checks as lines/games update)
 
 If loads feel slow, turn on **Fast mode** in the sidebar (skips per-game detail context for quicker refreshes).

@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Streamlit dashboard for the CBB betting algorithm."""
+"""Simplified Streamlit dashboard for CBB betting picks."""
 
 from __future__ import annotations
 
 import argparse
 import json
-from typing import Any, Dict, Iterable, List
+from collections import defaultdict
+from typing import Any, Dict, List, Tuple
 
-import pandas as pd
 import streamlit as st
 
 from cbb_betting_algorithm import run_analysis
@@ -27,35 +27,6 @@ DEFAULT_BOOK_OPTIONS = [
 ]
 
 
-def flatten_dict(data: Dict[str, Any], prefix: str = "", max_depth: int = 2) -> Dict[str, Any]:
-    output: Dict[str, Any] = {}
-    for key, value in data.items():
-        next_key = f"{prefix}.{key}" if prefix else str(key)
-        if isinstance(value, dict) and max_depth > 0:
-            output.update(flatten_dict(value, next_key, max_depth=max_depth - 1))
-        elif isinstance(value, list):
-            if not value:
-                output[next_key] = []
-            elif isinstance(value[0], dict):
-                output[next_key] = json.dumps(value)
-            else:
-                output[next_key] = ", ".join(str(x) for x in value)
-        else:
-            output[next_key] = value
-    return output
-
-
-def records_to_frame(
-    records: Iterable[Dict[str, Any]],
-    *,
-    max_depth: int = 2,
-) -> pd.DataFrame:
-    normalized = [flatten_dict(record, max_depth=max_depth) for record in records]
-    if not normalized:
-        return pd.DataFrame()
-    return pd.DataFrame(normalized)
-
-
 def build_engine_args(config: Dict[str, Any]) -> argparse.Namespace:
     return argparse.Namespace(
         league=config["league"],
@@ -63,13 +34,15 @@ def build_engine_args(config: Dict[str, Any]) -> argparse.Namespace:
         public_metric=config["public_metric"],
         book_ids=config["book_ids"],
         max_workers=config["max_workers"],
+        include_model=False,
+        compact_output=True,
         skip_detail_context=config["skip_detail_context"],
         request_timeout=config["request_timeout"],
         request_retries=config["request_retries"],
-        home_court_advantage=config["home_court_advantage"],
-        alt_target_low=config["alt_target_low"],
-        alt_target_high=config["alt_target_high"],
-        alt_target_mid=config["alt_target_mid"],
+        home_court_advantage=2.7,
+        alt_target_low=-250,
+        alt_target_high=-200,
+        alt_target_mid=-225,
         output="",
         watch=False,
         interval_seconds=0,
@@ -81,69 +54,246 @@ def build_engine_args(config: Dict[str, Any]) -> argparse.Namespace:
 
 @st.cache_data(show_spinner=False)
 def load_report_cached(config_json: str, refresh_key: int) -> Dict[str, Any]:
-    del refresh_key  # cache key input only
+    del refresh_key
     config = json.loads(config_json)
     args = build_engine_args(config)
     return run_analysis(args)
 
 
-def filter_matchup(records: List[Dict[str, Any]], term: str) -> List[Dict[str, Any]]:
+def format_seed(seed: Any) -> str:
+    if seed in (None, "", 0):
+        return ""
+    return f" ({seed})"
+
+
+def split_matchup(matchup: str) -> Tuple[str, str]:
+    if "@" in matchup:
+        away, home = matchup.split("@", 1)
+        return away.strip(), home.strip()
+    return matchup, ""
+
+
+def format_matchup(entry: Dict[str, Any]) -> str:
+    away = entry.get("away_team")
+    home = entry.get("home_team")
+    if not away or not home:
+        away, home = split_matchup(str(entry.get("matchup", "")))
+    away_seed = format_seed(entry.get("away_seed"))
+    home_seed = format_seed(entry.get("home_seed"))
+    if home:
+        return f"{away}{away_seed} @ {home}{home_seed}"
+    return f"{away}{away_seed}"
+
+
+def normalize_parameter_entries(report: Dict[str, Any]) -> List[Dict[str, Any]]:
+    normalized: List[Dict[str, Any]] = []
+
+    for record in report.get("parameter_1", []):
+        pick = record.get("recommended_pick") or {}
+        team = pick.get("team") or ""
+        line = pick.get("line")
+        odds = pick.get("odds")
+        pick_text = f"{team} {line} ({odds})" if line is not None else f"{team} ({odds})"
+        normalized.append(
+            {
+                "parameter": "Parameter 1",
+                "game_id": record.get("game_id"),
+                "matchup": record.get("matchup"),
+                "away_team": record.get("away_team"),
+                "home_team": record.get("home_team"),
+                "away_seed": record.get("away_seed"),
+                "home_seed": record.get("home_seed"),
+                "bet_type": "spread",
+                "pick_identifier": team.lower(),
+                "pick_text": pick_text,
+                "sportsbook": record.get("sportsbook"),
+                "public_pct": record.get("public_pct"),
+                "reason": record.get("reason"),
+            }
+        )
+
+    for record in report.get("parameter_2", {}).get("spread", []):
+        pick = record.get("recommended_pick") or {}
+        team = pick.get("team") or ""
+        line = pick.get("line")
+        odds = pick.get("odds")
+        pick_text = f"{team} {line} ({odds})" if line is not None else f"{team} ({odds})"
+        normalized.append(
+            {
+                "parameter": "Parameter 2 - Spread",
+                "game_id": record.get("game_id"),
+                "matchup": record.get("matchup"),
+                "away_team": record.get("away_team"),
+                "home_team": record.get("home_team"),
+                "away_seed": record.get("away_seed"),
+                "home_seed": record.get("home_seed"),
+                "bet_type": "spread",
+                "pick_identifier": team.lower(),
+                "pick_text": pick_text,
+                "sportsbook": record.get("sportsbook"),
+                "public_pct": record.get("public_pct"),
+                "reason": record.get("reason"),
+            }
+        )
+
+    for record in report.get("parameter_2", {}).get("totals", []):
+        pick = record.get("recommended_pick") or {}
+        side = str(pick.get("side") or "").title()
+        line = pick.get("line")
+        odds = pick.get("odds")
+        pick_text = f"{side} {line} ({odds})"
+        normalized.append(
+            {
+                "parameter": "Parameter 2 - Total",
+                "game_id": record.get("game_id"),
+                "matchup": record.get("matchup"),
+                "away_team": record.get("away_team"),
+                "home_team": record.get("home_team"),
+                "away_seed": record.get("away_seed"),
+                "home_seed": record.get("home_seed"),
+                "bet_type": "total",
+                "pick_identifier": side.lower(),
+                "pick_text": pick_text,
+                "sportsbook": record.get("sportsbook"),
+                "public_pct": record.get("public_pct"),
+                "reason": record.get("reason"),
+            }
+        )
+
+    for record in report.get("parameter_3", []):
+        safer = record.get("safer_alternate_pick") or {}
+        base_pick = record.get("base_pick") or {}
+        team = base_pick.get("team") or ""
+        sportsbook = safer.get("sportsbook") or record.get("analysis_sportsbook")
+
+        market = safer.get("market")
+        if market == "moneyline_proxy":
+            bet_type = "moneyline"
+            odds = safer.get("odds")
+            pick_text = f"{team} ML ({odds})"
+            pick_identifier = team.lower()
+        elif market == "alternate_spread":
+            bet_type = "spread"
+            line = safer.get("line")
+            odds = safer.get("odds")
+            pick_text = f"{team} {line} ({odds})"
+            pick_identifier = team.lower()
+        else:
+            bet_type = "spread"
+            line = base_pick.get("line")
+            odds = base_pick.get("odds")
+            pick_text = f"{team} {line} ({odds})"
+            pick_identifier = team.lower()
+
+        trigger = record.get("trigger") or {}
+        normalized.append(
+            {
+                "parameter": "Parameter 3",
+                "game_id": record.get("game_id"),
+                "matchup": record.get("matchup"),
+                "away_team": record.get("away_team"),
+                "home_team": record.get("home_team"),
+                "away_seed": record.get("away_seed"),
+                "home_seed": record.get("home_seed"),
+                "bet_type": bet_type,
+                "pick_identifier": pick_identifier,
+                "pick_text": pick_text,
+                "sportsbook": sportsbook,
+                "public_pct": trigger.get("public_pct"),
+                "reason": "Safer alternate-style version of the spread signal.",
+            }
+        )
+
+    return normalized
+
+
+def aggregate_top_recommendations(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    grouped: Dict[Tuple[Any, str, str], Dict[str, Any]] = {}
+    param_sets: Dict[Tuple[Any, str, str], set] = defaultdict(set)
+    public_pct_values: Dict[Tuple[Any, str, str], List[float]] = defaultdict(list)
+
+    for entry in entries:
+        key = (
+            entry.get("game_id"),
+            entry.get("bet_type", ""),
+            entry.get("pick_identifier", ""),
+        )
+        if key not in grouped:
+            grouped[key] = dict(entry)
+            grouped[key]["recommendation_score"] = 0
+        grouped[key]["recommendation_score"] += 1
+        param_sets[key].add(entry.get("parameter", ""))
+        public_pct = entry.get("public_pct")
+        if isinstance(public_pct, (int, float)):
+            public_pct_values[key].append(float(public_pct))
+
+    output: List[Dict[str, Any]] = []
+    for key, item in grouped.items():
+        score = int(item.get("recommendation_score", 0))
+        params = sorted(p for p in param_sets[key] if p)
+        public_values = public_pct_values[key]
+        avg_public = sum(public_values) / len(public_values) if public_values else None
+        item["parameters_triggered"] = params
+        item["average_public_pct"] = round(avg_public, 2) if avg_public is not None else None
+        item["recommendation_score"] = score
+        output.append(item)
+
+    output.sort(
+        key=lambda x: (
+            -int(x.get("recommendation_score", 0)),
+            -(float(x.get("average_public_pct")) if x.get("average_public_pct") is not None else -1),
+            str(x.get("matchup", "")),
+        )
+    )
+    return output
+
+
+def filter_matchup(entries: List[Dict[str, Any]], term: str) -> List[Dict[str, Any]]:
     if not term:
-        return records
+        return entries
     query = term.lower().strip()
-    return [r for r in records if query in str(r.get("matchup", "")).lower()]
+    return [entry for entry in entries if query in str(entry.get("matchup", "")).lower()]
 
 
-def filter_model_supported(records: List[Dict[str, Any]], only_supported: bool) -> List[Dict[str, Any]]:
-    if not only_supported:
-        return records
-    filtered: List[Dict[str, Any]] = []
-    for record in records:
-        alignment = record.get("model_alignment") or {}
-        if alignment.get("model_supports_pick"):
-            filtered.append(record)
-    return filtered
-
-
-def filter_edge_threshold(records: List[Dict[str, Any]], min_edge: float) -> List[Dict[str, Any]]:
-    if min_edge <= 0:
-        return records
-    filtered: List[Dict[str, Any]] = []
-    for record in records:
-        alignment = record.get("model_alignment") or {}
-        edge = alignment.get("edge_points")
-        if edge is None:
-            continue
-        try:
-            if float(edge) >= min_edge:
-                filtered.append(record)
-        except (TypeError, ValueError):
-            continue
-    return filtered
-
-
-def render_table(records: List[Dict[str, Any]], *, max_depth: int = 2) -> None:
-    if not records:
-        st.info("No rows match the current filters.")
+def render_pick_cards(entries: List[Dict[str, Any]], *, show_score: bool = False) -> None:
+    if not entries:
+        st.info("No picks match this view.")
         return
-    frame = records_to_frame(records, max_depth=max_depth)
-    st.dataframe(frame, use_container_width=True, hide_index=True)
+
+    for entry in entries:
+        with st.container(border=True):
+            st.markdown(f"**{format_matchup(entry)}**")
+            st.markdown(f"### Pick: {entry.get('pick_text', 'N/A')}")
+            line_parts = [
+                entry.get("parameter", ""),
+                str(entry.get("bet_type", "")).upper(),
+                entry.get("sportsbook", ""),
+            ]
+            if show_score:
+                line_parts.append(f"Score: {entry.get('recommendation_score', 0)}")
+            meta = " • ".join(part for part in line_parts if part)
+            st.caption(meta)
+
+            if show_score:
+                params = entry.get("parameters_triggered") or []
+                if params:
+                    st.caption(f"Triggered by: {', '.join(params)}")
+                avg_public = entry.get("average_public_pct")
+                if avg_public is not None:
+                    st.caption(f"Average public % across triggers: {avg_public}")
+
+            reason = entry.get("reason")
+            if reason:
+                st.write(reason)
 
 
 def main() -> None:
-    st.set_page_config(
-        page_title="CBB Betting Dashboard",
-        page_icon="🏀",
-        layout="wide",
-    )
-    st.title("🏀 College Basketball Betting Algorithm Dashboard")
-    st.caption(
-        "Live market + public split signals with model projections "
-        "(power/efficiency proxy/injury/home-court)."
-    )
+    st.set_page_config(page_title="CBB Betting Picks", page_icon="🏀", layout="wide")
+    st.title("🏀 CBB Betting Picks")
+    st.caption("Simplified board: parameters, picks, and top recommended bets.")
 
     with st.sidebar:
-        st.header("Run settings")
+        st.header("Settings")
         league = st.text_input("League", value="ncaab")
         public_threshold = st.slider("Public threshold (%)", 50.0, 95.0, 70.0, 1.0)
         public_metric = st.selectbox("Public metric", ["money", "tickets"], index=0)
@@ -156,31 +306,20 @@ def main() -> None:
                 str(book_id),
             ),
         )
-        home_court_advantage = st.slider("Home-court advantage", 0.0, 6.0, 2.7, 0.1)
-        max_workers = st.slider("Parallel workers", 1, 20, 10, 1)
-        fast_mode = st.toggle(
-            "Fast mode (skip detail context)",
-            value=True,
-            help=(
-                "Faster loads by skipping per-game detail pages "
-                "(injury/trend context)."
-            ),
-        )
-        request_timeout = st.slider("Request timeout (sec)", 5, 40, 15, 1)
-        request_retries = st.slider("Request retries", 1, 5, 2, 1)
 
-        st.subheader("Parameter 3 odds target")
-        alt_target_low = st.number_input("Target low", value=-250, step=5)
-        alt_target_high = st.number_input("Target high", value=-200, step=5)
-        alt_target_mid = st.number_input("Target midpoint", value=-225, step=5)
+        with st.expander("Performance", expanded=False):
+            fast_mode = st.toggle("Fast mode", value=True)
+            max_workers = st.slider("Parallel workers", 1, 20, 8, 1)
+            request_timeout = st.slider("Request timeout (sec)", 5, 40, 12, 1)
+            request_retries = st.slider("Request retries", 1, 5, 2, 1)
 
         st.subheader("Refresh")
         auto_refresh = st.toggle("Auto-refresh", value=True)
-        refresh_seconds = st.slider("Refresh interval (sec)", 15, 600, 120, 15)
+        refresh_seconds = st.slider("Refresh every (sec)", 15, 600, 120, 15)
         manual_refresh = st.button("Refresh now")
 
     if not selected_books:
-        st.error("Select at least one sportsbook in the sidebar.")
+        st.error("Pick at least one sportsbook.")
         st.stop()
 
     refresh_key = 0
@@ -192,16 +331,13 @@ def main() -> None:
 
     if auto_refresh:
         if st_autorefresh is None:
-            st.warning(
-                "Auto-refresh package not installed. "
-                "Install `streamlit-autorefresh` or use manual refresh."
-            )
+            st.warning("Install `streamlit-autorefresh` to enable auto-refresh.")
         else:
-            tick_count = st_autorefresh(
+            ticks = st_autorefresh(
                 interval=int(refresh_seconds * 1000),
-                key="cbb_auto_refresh",
+                key="cbb_refresh_simple",
             )
-            refresh_key += int(tick_count)
+            refresh_key += int(ticks)
 
     config = {
         "league": league.strip() or "ncaab",
@@ -212,26 +348,17 @@ def main() -> None:
         "skip_detail_context": bool(fast_mode),
         "request_timeout": int(request_timeout),
         "request_retries": int(request_retries),
-        "home_court_advantage": float(home_court_advantage),
-        "alt_target_low": int(alt_target_low),
-        "alt_target_high": int(alt_target_high),
-        "alt_target_mid": int(alt_target_mid),
     }
     config_json = json.dumps(config, sort_keys=True)
 
-    st.info(
-        "Loading live data now... If this feels stuck, enable Fast mode, "
-        "lower retries, or click Refresh now."
-    )
-    with st.spinner("Pulling live games, lines, and model context..."):
+    st.info("Loading live picks... If slow, keep Fast mode on.")
+    with st.spinner("Fetching games and generating parameter picks..."):
         try:
             report = load_report_cached(config_json, refresh_key)
         except Exception as exc:
             fallback_report = st.session_state.get("last_successful_report")
             if fallback_report:
-                st.warning(
-                    f"Live refresh failed ({exc}). Showing last successful snapshot."
-                )
+                st.warning(f"Live refresh failed ({exc}). Showing last successful snapshot.")
                 report = fallback_report
             else:
                 st.error(f"Failed to load report: {exc}")
@@ -240,96 +367,78 @@ def main() -> None:
             st.session_state["last_successful_report"] = report
 
     metadata = report.get("metadata", {})
-    all_games_snapshot = report.get("all_games_snapshot", [])
-    model_projections = report.get("model_projections", [])
-    parameter_1 = report.get("parameter_1", [])
-    parameter_2_spread = report.get("parameter_2", {}).get("spread", [])
-    parameter_2_totals = report.get("parameter_2", {}).get("totals", [])
-    parameter_3 = report.get("parameter_3", [])
+    entries = normalize_parameter_entries(report)
+    top_recommendations = aggregate_top_recommendations(entries)
 
-    col1, col2, col3, col4, col5, col6 = st.columns(6)
-    col1.metric("Games", len(all_games_snapshot))
-    col2.metric("Model projections", len(model_projections))
-    col3.metric("Parameter 1", len(parameter_1))
-    col4.metric("Param 2 spread", len(parameter_2_spread))
-    col5.metric("Param 2 totals", len(parameter_2_totals))
-    col6.metric("Parameter 3", len(parameter_3))
+    p1_count = len(report.get("parameter_1", []))
+    p2_count = len(report.get("parameter_2", {}).get("spread", [])) + len(
+        report.get("parameter_2", {}).get("totals", [])
+    )
+    p3_count = len(report.get("parameter_3", []))
+    game_count = len(report.get("all_games_snapshot", []))
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Games", game_count)
+    m2.metric("Parameter 1 picks", p1_count)
+    m3.metric("Parameter 2 picks", p2_count)
+    m4.metric("Parameter 3 picks", p3_count)
 
     st.caption(
-        "Generated: {generated} | Public metric: {metric} | Threshold: {threshold}% | "
-        "Books: {books} | Detail context: {detail_context} | Timeout: {timeout}s x {retries}".format(
+        "Generated: {generated} | Metric: {metric} | Threshold: {threshold}% | Books: {books}".format(
             generated=metadata.get("generated_at_utc", "unknown"),
             metric=metadata.get("public_metric", "unknown"),
             threshold=metadata.get("public_threshold_pct", "unknown"),
             books=", ".join(str(x) for x in metadata.get("preferred_book_ids", [])),
-            detail_context=(
-                "on" if metadata.get("detail_context_enabled", True) else "off (fast mode)"
-            ),
-            timeout=metadata.get("request_timeout_seconds", "unknown"),
-            retries=metadata.get("request_retries", "unknown"),
         )
     )
 
     st.divider()
-    st.subheader("Filters")
-    filter_col1, filter_col2, filter_col3 = st.columns([2, 1, 1])
-    matchup_filter = filter_col1.text_input("Matchup contains")
-    model_supported_only = filter_col2.toggle("Only model-supported picks", value=False)
-    min_model_edge = filter_col3.number_input("Min model edge", value=0.0, step=0.25)
+    filter_col1, filter_col2 = st.columns([2, 1])
+    matchup_filter = filter_col1.text_input("Filter by matchup")
+    min_score = filter_col2.slider("Top bets min score", 1, 3, 1, 1)
+
+    filtered_entries = filter_matchup(entries, matchup_filter)
+    filtered_top = filter_matchup(top_recommendations, matchup_filter)
+    filtered_top = [
+        entry for entry in filtered_top if int(entry.get("recommendation_score", 0)) >= min_score
+    ]
 
     tabs = st.tabs(
         [
-            "Overview",
+            "Top Recommended Bets",
             "Parameter 1",
-            "Parameter 2 (Spread)",
-            "Parameter 2 (Totals)",
+            "Parameter 2",
             "Parameter 3",
-            "Model Projections",
-            "Raw JSON",
+            "All Picks",
         ]
     )
 
     with tabs[0]:
-        st.markdown("### Game Snapshot (selected sportsbooks)")
-        filtered_games = filter_matchup(all_games_snapshot, matchup_filter)
-        render_table(filtered_games, max_depth=3)
+        st.subheader("Most Recommended Bets (descending)")
+        render_pick_cards(filtered_top, show_score=True)
 
     with tabs[1]:
-        st.markdown("### Parameter 1 Picks")
-        rows = filter_matchup(parameter_1, matchup_filter)
-        rows = filter_model_supported(rows, model_supported_only)
-        rows = filter_edge_threshold(rows, min_model_edge)
-        render_table(rows, max_depth=3)
+        st.subheader("Parameter 1 Picks")
+        section = [e for e in filtered_entries if e.get("parameter") == "Parameter 1"]
+        render_pick_cards(section)
 
     with tabs[2]:
-        st.markdown("### Parameter 2 Spread Picks")
-        rows = filter_matchup(parameter_2_spread, matchup_filter)
-        rows = filter_model_supported(rows, model_supported_only)
-        rows = filter_edge_threshold(rows, min_model_edge)
-        render_table(rows, max_depth=3)
+        st.subheader("Parameter 2 Picks")
+        spread = [e for e in filtered_entries if e.get("parameter") == "Parameter 2 - Spread"]
+        totals = [e for e in filtered_entries if e.get("parameter") == "Parameter 2 - Total"]
+        st.markdown("#### Spread")
+        render_pick_cards(spread)
+        st.markdown("#### Totals")
+        render_pick_cards(totals)
 
     with tabs[3]:
-        st.markdown("### Parameter 2 Total Picks")
-        rows = filter_matchup(parameter_2_totals, matchup_filter)
-        rows = filter_model_supported(rows, model_supported_only)
-        rows = filter_edge_threshold(rows, min_model_edge)
-        render_table(rows, max_depth=3)
+        st.subheader("Parameter 3 Picks")
+        section = [e for e in filtered_entries if e.get("parameter") == "Parameter 3"]
+        render_pick_cards(section)
 
     with tabs[4]:
-        st.markdown("### Parameter 3 Safer Alternate-Style Picks")
-        rows = filter_matchup(parameter_3, matchup_filter)
-        rows = filter_model_supported(rows, model_supported_only)
-        rows = filter_edge_threshold(rows, min_model_edge)
-        render_table(rows, max_depth=4)
-
-    with tabs[5]:
-        st.markdown("### Model Projections")
-        rows = filter_matchup(model_projections, matchup_filter)
-        render_table(rows, max_depth=4)
-
-    with tabs[6]:
-        st.markdown("### Raw Report JSON")
-        st.json(report)
+        st.subheader("All Parameter Picks")
+        render_pick_cards(filtered_entries)
 
 
 if __name__ == "__main__":
