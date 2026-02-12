@@ -5,11 +5,13 @@ College basketball betting signal engine based on public splits and line movemen
 Data sources:
 - Action Network NCAAB public betting page (current game board and sportsbook metadata)
 - Action Network market history endpoint for opening-to-current line movement
+- Action Network game detail pages (trend + injury context for model projections)
 
 The report contains:
 1) Parameter 1 picks
 2) Parameter 2 picks (spread + total)
 3) Parameter 3 picks (safer alternate-style recommendation)
+4) Model projections (team power/efficiency proxies/injury adjustments)
 """
 
 from __future__ import annotations
@@ -38,6 +40,18 @@ USER_AGENT = (
 # NJ book IDs exposed on the Action odds/public board.
 DEFAULT_BOOK_IDS = [68, 69, 71, 75, 79]
 DEFAULT_PUBLIC_THRESHOLD = 70.0
+DEFAULT_REFRESH_INTERVAL_SECONDS = 120
+DEFAULT_HOME_COURT_ADVANTAGE = 2.7
+
+INJURY_STATUS_WEIGHTS = {
+    "out_for_season": 1.35,
+    "out": 1.0,
+    "suspended": 1.0,
+    "doubtful": 0.8,
+    "questionable": 0.45,
+    "day_to_day": 0.35,
+    "probable": 0.1,
+}
 
 
 class DataFetchError(RuntimeError):
@@ -52,6 +66,42 @@ def parse_iso(ts: str) -> dt.datetime:
     if ts.endswith("Z"):
         ts = ts[:-1] + "+00:00"
     return dt.datetime.fromisoformat(ts)
+
+
+def clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def safe_float(value: Any, fallback: float) -> float:
+    try:
+        if value is None:
+            return fallback
+        return float(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def normalize_team_name(name: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (name or "").lower())
+
+
+def standings_win_pct(team: Dict[str, Any]) -> float:
+    standings = team.get("standings") or {}
+    wins = safe_float(standings.get("win"), 0.0)
+    losses = safe_float(standings.get("loss"), 0.0)
+    total = wins + losses
+    if total <= 0:
+        return 0.5
+    return wins / total
+
+
+def find_record_win_pct(
+    records: List[Dict[str, Any]], record_type: str, fallback: float
+) -> float:
+    for record in records:
+        if record.get("record_type") == record_type:
+            return safe_float(record.get("win_pct"), fallback)
+    return fallback
 
 
 def request_with_retries(
@@ -99,7 +149,11 @@ def fetch_board_data(
     session: requests.Session, league: str
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]], Dict[int, str]]:
     page_url = f"{ACTION_SITE_ROOT}/{league}/public-betting"
-    response = request_with_retries(session, page_url)
+    response = request_with_retries(
+        session,
+        page_url,
+        params={"_ts": int(time.time() * 1000)},
+    )
     if response.status_code != 200:
         raise DataFetchError(
             f"Unexpected status code {response.status_code} for {page_url}"
@@ -113,8 +167,10 @@ def fetch_board_data(
     all_books = page_props.get("allBooks", {})
 
     # Build a game_id -> detail page URL map.
+    game_route_prefix = re.escape(f"/{league}-game/")
+    game_href_regex = rf'href="({game_route_prefix}[^"]+/(\d+))"'
     game_links: Dict[int, str] = {}
-    for href, game_id_str in re.findall(r'href="(/ncaab-game/[^"]+/(\d+))"', html):
+    for href, game_id_str in re.findall(game_href_regex, html):
         try:
             game_id = int(game_id_str)
         except ValueError:
@@ -137,6 +193,296 @@ def fetch_market_history(
             f"History fetch failed for game {game_id} (status {response.status_code})"
         )
     return response.json()
+
+
+def fetch_game_detail_context(
+    session: requests.Session, game_id: int, game_url: Optional[str]
+) -> Dict[str, Any]:
+    if not game_url:
+        return {}
+
+    response = request_with_retries(
+        session,
+        game_url,
+        params={"_ts": int(time.time() * 1000)},
+    )
+    if response.status_code != 200:
+        raise DataFetchError(
+            f"Game detail fetch failed for game {game_id} (status {response.status_code})"
+        )
+
+    page_props = parse_next_data(response.text).get("props", {}).get("pageProps", {})
+    game_payload = page_props.get("game", {})
+    situational = game_payload.get("trends", {}).get("situational", {})
+    injuries = page_props.get("injuries") if isinstance(page_props.get("injuries"), list) else []
+
+    return {
+        "situational": situational,
+        "injuries": injuries,
+    }
+
+
+def build_team_aliases(team: Dict[str, Any]) -> List[str]:
+    aliases = [
+        team.get("display_name"),
+        team.get("full_name"),
+        team.get("short_name"),
+        team.get("abbr"),
+        team.get("location"),
+    ]
+    unique_aliases: List[str] = []
+    seen = set()
+    for value in aliases:
+        normalized = normalize_team_name(str(value or ""))
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        unique_aliases.append(normalized)
+    return unique_aliases
+
+
+def summarize_team_injuries(
+    injuries: List[Dict[str, Any]], teams: Dict[str, Dict[str, Any]]
+) -> Dict[str, Dict[str, float]]:
+    side_aliases = {
+        "home": set(build_team_aliases(teams["home"])),
+        "away": set(build_team_aliases(teams["away"])),
+    }
+
+    summary = {
+        "home": {"count": 0.0, "key_count": 0.0, "impact": 0.0},
+        "away": {"count": 0.0, "key_count": 0.0, "impact": 0.0},
+    }
+
+    for injury in injuries:
+        team_block = injury.get("team") or {}
+        injury_team_name = normalize_team_name(
+            str(team_block.get("display_name") or team_block.get("full_name") or "")
+        )
+        if not injury_team_name:
+            continue
+
+        side = None
+        if injury_team_name in side_aliases["home"]:
+            side = "home"
+        elif injury_team_name in side_aliases["away"]:
+            side = "away"
+        if not side:
+            continue
+
+        status = str(injury.get("status") or "").lower().strip()
+        status_weight = INJURY_STATUS_WEIGHTS.get(status, 0.25)
+        is_key_player = bool(injury.get("is_key_player"))
+        impact = status_weight * (1.35 if is_key_player else 1.0)
+
+        summary[side]["count"] += 1.0
+        summary[side]["impact"] += impact
+        if is_key_player:
+            summary[side]["key_count"] += 1.0
+
+    return summary
+
+
+def build_team_model_profile(
+    *,
+    side: str,
+    teams: Dict[str, Dict[str, Any]],
+    situational: Dict[str, Any],
+    injury_summary: Dict[str, Dict[str, float]],
+) -> Dict[str, float]:
+    team = teams[side]
+    trend = situational.get(side) or {}
+    records = trend.get("records") or []
+
+    win_pct = safe_float(trend.get("win_p"), standings_win_pct(team))
+    points_for = safe_float(trend.get("points_for"), 70.0)
+    points_against = safe_float(trend.get("points_against"), 70.0)
+    point_diff = safe_float(trend.get("point_diff"), points_for - points_against)
+    last_10_win_pct = find_record_win_pct(records, "last_10", win_pct)
+    conference_win_pct = find_record_win_pct(records, "conference", win_pct)
+
+    injury_count = injury_summary[side]["count"]
+    key_injury_count = injury_summary[side]["key_count"]
+    injury_impact = injury_summary[side]["impact"]
+
+    power_rating = 100.0
+    power_rating += (win_pct - 0.5) * 26.0
+    power_rating += point_diff * 1.45
+    power_rating += (last_10_win_pct - 0.5) * 10.0
+    power_rating += (conference_win_pct - 0.5) * 6.0
+    power_rating += (points_for - 70.0) * 0.33
+    power_rating += (70.0 - points_against) * 0.33
+    power_rating -= injury_impact * 2.15
+
+    return {
+        "win_pct": win_pct,
+        "last_10_win_pct": last_10_win_pct,
+        "conference_win_pct": conference_win_pct,
+        "points_for": points_for,
+        "points_against": points_against,
+        "point_diff": point_diff,
+        "injury_count": injury_count,
+        "key_injury_count": key_injury_count,
+        "injury_impact": injury_impact,
+        "power_rating": power_rating,
+    }
+
+
+def build_model_projection(
+    *,
+    game: Dict[str, Any],
+    teams: Dict[str, Dict[str, Any]],
+    detail_context: Dict[str, Any],
+    home_court_advantage: float,
+) -> Dict[str, Any]:
+    situational = detail_context.get("situational") or {}
+    injuries = detail_context.get("injuries") or []
+    injury_summary = summarize_team_injuries(injuries, teams)
+
+    home_profile = build_team_model_profile(
+        side="home",
+        teams=teams,
+        situational=situational,
+        injury_summary=injury_summary,
+    )
+    away_profile = build_team_model_profile(
+        side="away",
+        teams=teams,
+        situational=situational,
+        injury_summary=injury_summary,
+    )
+
+    home_off_base = (home_profile["points_for"] + away_profile["points_against"]) / 2.0
+    away_off_base = (away_profile["points_for"] + home_profile["points_against"]) / 2.0
+    power_gap = home_profile["power_rating"] - away_profile["power_rating"]
+
+    projected_home_score = (
+        home_off_base
+        + home_court_advantage * 0.58
+        + power_gap * 0.16
+        - home_profile["injury_impact"] * 0.28
+        + away_profile["injury_impact"] * 0.12
+    )
+    projected_away_score = (
+        away_off_base
+        - home_court_advantage * 0.42
+        - power_gap * 0.12
+        - away_profile["injury_impact"] * 0.28
+        + home_profile["injury_impact"] * 0.12
+    )
+
+    projected_home_score = clamp(projected_home_score, 45.0, 110.0)
+    projected_away_score = clamp(projected_away_score, 45.0, 110.0)
+
+    projected_margin_home = projected_home_score - projected_away_score
+    projected_total = projected_home_score + projected_away_score
+    model_home_spread = -projected_margin_home
+    home_win_probability = 1.0 / (1.0 + math.exp(-(projected_margin_home / 6.5)))
+    home_win_probability = clamp(home_win_probability, 0.01, 0.99)
+
+    confidence_score = clamp(
+        50.0
+        + abs(power_gap) * 0.9
+        + abs(projected_margin_home) * 1.2
+        + abs(projected_total - 140.0) * 0.2,
+        50.0,
+        99.0,
+    )
+
+    return {
+        "home_team": teams["home"]["display_name"],
+        "away_team": teams["away"]["display_name"],
+        "home_profile": {
+            key: round(value, 4) for key, value in home_profile.items()
+        },
+        "away_profile": {
+            key: round(value, 4) for key, value in away_profile.items()
+        },
+        "projected_home_score": round(projected_home_score, 3),
+        "projected_away_score": round(projected_away_score, 3),
+        "projected_margin_home": round(projected_margin_home, 3),
+        "projected_total": round(projected_total, 3),
+        "model_home_spread": round(model_home_spread, 3),
+        "home_win_probability": round(home_win_probability, 4),
+        "away_win_probability": round(1.0 - home_win_probability, 4),
+        "confidence_score": round(confidence_score, 2),
+        "inputs_available": bool(detail_context),
+    }
+
+
+def model_market_edges(
+    *,
+    model_projection: Dict[str, Any],
+    spread_summary: Optional[Dict[str, Any]],
+    total_summary: Optional[Dict[str, Any]],
+    teams: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    edges: Dict[str, Any] = {"spread": None, "total": None}
+    projected_margin_home = float(model_projection["projected_margin_home"])
+    projected_total = float(model_projection["projected_total"])
+
+    if spread_summary:
+        market_home_spread = float(spread_summary["lines"]["home"]["current"]["line"])
+        market_away_spread = float(spread_summary["lines"]["away"]["current"]["line"])
+        home_cover_edge = projected_margin_home + market_home_spread
+        away_cover_edge = -projected_margin_home + market_away_spread
+        preferred_side = "home" if home_cover_edge >= away_cover_edge else "away"
+        edges["spread"] = {
+            "market_home_spread": market_home_spread,
+            "market_away_spread": market_away_spread,
+            "home_cover_edge": round(home_cover_edge, 3),
+            "away_cover_edge": round(away_cover_edge, 3),
+            "preferred_side": preferred_side,
+            "preferred_team": teams[preferred_side]["display_name"],
+        }
+
+    if total_summary:
+        market_total = float(total_summary["current_total"])
+        total_edge_over = projected_total - market_total
+        edges["total"] = {
+            "market_total": market_total,
+            "total_edge_over": round(total_edge_over, 3),
+            "total_edge_under": round(-total_edge_over, 3),
+            "lean": "over" if total_edge_over > 0 else "under",
+        }
+
+    return edges
+
+
+def spread_pick_model_alignment(
+    model_edges: Dict[str, Any], pick_side: str
+) -> Optional[Dict[str, Any]]:
+    spread_edges = model_edges.get("spread")
+    if not spread_edges:
+        return None
+    edge_key = f"{pick_side}_cover_edge"
+    pick_edge = spread_edges.get(edge_key)
+    if pick_edge is None:
+        return None
+    return {
+        "model_supports_pick": bool(pick_edge > 0),
+        "edge_points": round(float(pick_edge), 3),
+        "model_preferred_side": spread_edges.get("preferred_side"),
+    }
+
+
+def total_pick_model_alignment(
+    model_edges: Dict[str, Any], pick_side: str
+) -> Optional[Dict[str, Any]]:
+    total_edges = model_edges.get("total")
+    if not total_edges:
+        return None
+    if pick_side == "over":
+        edge_points = safe_float(total_edges.get("total_edge_over"), 0.0)
+    elif pick_side == "under":
+        edge_points = safe_float(total_edges.get("total_edge_under"), 0.0)
+    else:
+        return None
+    return {
+        "model_supports_pick": bool(edge_points > 0),
+        "edge_points": round(edge_points, 3),
+        "model_total_lean": total_edges.get("lean"),
+    }
 
 
 def get_book_name(book_meta: Dict[str, Any]) -> str:
@@ -560,23 +906,53 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
     preferred_book_ids = [int(x) for x in args.book_ids.split(",") if x.strip()]
 
     histories: Dict[int, Dict[str, Any]] = {}
+    detail_contexts: Dict[int, Dict[str, Any]] = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.max_workers) as executor:
-        future_map = {
-            executor.submit(fetch_market_history, session, game["id"], preferred_book_ids): game["id"]
-            for game in games
-        }
+        future_map: Dict[concurrent.futures.Future, Tuple[str, int]] = {}
+        for game in games:
+            game_id = game["id"]
+            future_map[
+                executor.submit(
+                    fetch_market_history,
+                    session,
+                    game_id,
+                    preferred_book_ids,
+                )
+            ] = ("history", game_id)
+
+            game_url = game_links.get(game_id)
+            if game_url:
+                future_map[
+                    executor.submit(
+                        fetch_game_detail_context,
+                        session,
+                        game_id,
+                        game_url,
+                    )
+                ] = ("detail", game_id)
+
         for future in concurrent.futures.as_completed(future_map):
-            game_id = future_map[future]
+            fetch_kind, game_id = future_map[future]
             try:
-                histories[game_id] = future.result()
+                result = future.result()
+                if fetch_kind == "history":
+                    histories[game_id] = result
+                else:
+                    detail_contexts[game_id] = result
             except Exception as exc:  # pragma: no cover - network-dependent
-                histories[game_id] = {}
+                if fetch_kind == "history":
+                    histories[game_id] = {}
+                    warning_context = "history"
+                else:
+                    detail_contexts[game_id] = {}
+                    warning_context = "detail context"
                 print(
-                    f"[warn] Failed to fetch history for game {game_id}: {exc}",
+                    f"[warn] Failed to fetch {warning_context} for game {game_id}: {exc}",
                     file=sys.stderr,
                 )
 
     all_games_snapshot: List[Dict[str, Any]] = []
+    model_projections: List[Dict[str, Any]] = []
     parameter_1: List[Dict[str, Any]] = []
     parameter_2_spread: List[Dict[str, Any]] = []
     parameter_2_total: List[Dict[str, Any]] = []
@@ -595,25 +971,69 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
         )
 
         teams = get_teams(game)
+        detail_context = detail_contexts.get(game_id) or {}
+        model_projection = build_model_projection(
+            game=game,
+            teams=teams,
+            detail_context=detail_context,
+            home_court_advantage=args.home_court_advantage,
+        )
+
         analysis_book = pick_analysis_book(history_data, preferred_book_ids)
+        matchup = f"{teams['away']['display_name']} @ {teams['home']['display_name']}"
+        game_url = game_links.get(game_id)
+        sportsbook = (
+            get_book_name(all_books.get(analysis_book, {}))
+            if analysis_book
+            else None
+        )
+        event = history_data.get(analysis_book, {}).get("event", {}) if analysis_book else {}
+        spread_summary = (
+            spread_movement_summary(
+                event=event,
+                teams=teams,
+                public_metric=args.public_metric,
+                threshold=args.public_threshold,
+            )
+            if analysis_book
+            else None
+        )
+        total_summary = (
+            total_movement_summary(
+                event=event,
+                public_metric=args.public_metric,
+                threshold=args.public_threshold,
+            )
+            if analysis_book
+            else None
+        )
+        model_edges = model_market_edges(
+            model_projection=model_projection,
+            spread_summary=spread_summary,
+            total_summary=total_summary,
+            teams=teams,
+        )
+
+        model_projections.append(
+            {
+                "game_id": game_id,
+                "matchup": matchup,
+                "start_time_utc": game.get("start_time"),
+                "game_url": game_url,
+                "analysis_sportsbook": sportsbook,
+                "analysis_book_id": int(analysis_book) if analysis_book else None,
+                "line_release_utc": spread_summary["release_utc"] if spread_summary else None,
+                "line_last_update_utc": spread_summary["last_update_utc"] if spread_summary else None,
+                "total_release_utc": total_summary["release_utc"] if total_summary else None,
+                "total_last_update_utc": total_summary["last_update_utc"] if total_summary else None,
+                "model_projection": model_projection,
+                "market_edges": model_edges,
+            }
+        )
+
         if not analysis_book:
             continue
 
-        event = history_data.get(analysis_book, {}).get("event", {})
-        spread_summary = spread_movement_summary(
-            event=event,
-            teams=teams,
-            public_metric=args.public_metric,
-            threshold=args.public_threshold,
-        )
-        total_summary = total_movement_summary(
-            event=event,
-            public_metric=args.public_metric,
-            threshold=args.public_threshold,
-        )
-
-        matchup = f"{teams['away']['display_name']} @ {teams['home']['display_name']}"
-        sportsbook = get_book_name(all_books.get(analysis_book, {}))
         game_url = game_links.get(game_id)
 
         # ----------------------------
@@ -650,6 +1070,10 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
                             "line": fade_line,
                             "odds": fade_odds,
                         },
+                        "model_alignment": spread_pick_model_alignment(
+                            model_edges,
+                            fade_side,
+                        ),
                         "reason": (
                             f"Public is {spread_summary['heavy_public_pct']:.1f}% on "
                             f"{spread_summary['heavy_public_team']} but line did not move "
@@ -692,6 +1116,10 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
                             "line": fade_line,
                             "odds": fade_odds,
                         },
+                        "model_alignment": spread_pick_model_alignment(
+                            model_edges,
+                            fade_side,
+                        ),
                         "reason": (
                             "Public side and spread movement are in conflict "
                             "(reverse line movement signal)."
@@ -741,6 +1169,10 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
                             "odds": fade_odds,
                         },
                         "safer_alternate_pick": alt_pick,
+                        "model_alignment": spread_pick_model_alignment(
+                            model_edges,
+                            fade_side,
+                        ),
                         "target_odds_window": {
                             "min": args.alt_target_low,
                             "max": args.alt_target_high,
@@ -780,6 +1212,10 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
                             "line": fade_line,
                             "odds": fade_odds,
                         },
+                        "model_alignment": total_pick_model_alignment(
+                            model_edges,
+                            fade_side,
+                        ),
                         "reason": (
                             "Public total side and total movement are in conflict "
                             "(reverse line movement signal)."
@@ -793,6 +1229,7 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
             "league": args.league,
             "public_threshold_pct": args.public_threshold,
             "public_metric": args.public_metric,
+            "home_court_advantage": args.home_court_advantage,
             "preferred_book_ids": preferred_book_ids,
             "preferred_sportsbooks": [
                 {
@@ -808,9 +1245,11 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
             "notes": [
                 "Line release date is taken from the earliest 'opener' timestamp in market history.",
                 "Parameter 3 attempts explicit alternate spread odds first; if unavailable in feed, it falls back to a safer moneyline proxy.",
+                "Model projections use trend and injury context from each game detail page.",
             ],
         },
         "all_games_snapshot": all_games_snapshot,
+        "model_projections": model_projections,
         "parameter_1": parameter_1,
         "parameter_2": {
             "spread": parameter_2_spread,
@@ -859,6 +1298,12 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
         help="Max worker threads for per-game history calls (default: 10).",
     )
     parser.add_argument(
+        "--home-court-advantage",
+        type=float,
+        default=DEFAULT_HOME_COURT_ADVANTAGE,
+        help="Home-court points added in model projections (default: 2.7).",
+    )
+    parser.add_argument(
         "--alt-target-low",
         type=int,
         default=-250,
@@ -884,11 +1329,187 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
             "Default: reports/cbb_betting_report_<UTC timestamp>.json"
         ),
     )
+    parser.add_argument(
+        "--watch",
+        action="store_true",
+        help="Continuously refresh reports on an interval.",
+    )
+    parser.add_argument(
+        "--interval-seconds",
+        type=int,
+        default=DEFAULT_REFRESH_INTERVAL_SECONDS,
+        help=f"Refresh interval for --watch mode (default: {DEFAULT_REFRESH_INTERVAL_SECONDS}).",
+    )
+    parser.add_argument(
+        "--max-iterations",
+        type=int,
+        default=0,
+        help="Max loops in --watch mode. 0 means run indefinitely (default: 0).",
+    )
+    parser.add_argument(
+        "--latest-output",
+        default="reports/latest_cbb_report.json",
+        help=(
+            "Latest report path written each watch iteration "
+            "(default: reports/latest_cbb_report.json)."
+        ),
+    )
+    parser.add_argument(
+        "--archive-dir",
+        default="reports/archive",
+        help=(
+            "Archive directory for timestamped watch reports. "
+            "Set empty string to disable archives."
+        ),
+    )
     return parser.parse_args(argv)
+
+
+def ensure_parent_dir(file_path: str) -> None:
+    parent = os.path.dirname(file_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
+def write_report_json(report: Dict[str, Any], output_path: str) -> None:
+    ensure_parent_dir(output_path)
+    with open(output_path, "w", encoding="utf-8") as file_handle:
+        json.dump(report, file_handle, indent=2)
+
+
+def market_signature_map(report: Dict[str, Any]) -> Dict[int, Tuple[Any, Any]]:
+    signatures: Dict[int, Tuple[Any, Any]] = {}
+    for game in report.get("all_games_snapshot", []):
+        game_id = game.get("game_id")
+        books = game.get("books") or []
+        if game_id is None or not books:
+            continue
+        primary_book = books[0]
+        spread_home = None
+        total_value = None
+        if primary_book.get("spread"):
+            spread_home = (
+                primary_book["spread"]
+                .get("home", {})
+                .get("current", {})
+                .get("line")
+            )
+        if primary_book.get("total"):
+            total_value = (
+                primary_book["total"]
+                .get("over", {})
+                .get("current", {})
+                .get("line")
+            )
+        signatures[int(game_id)] = (spread_home, total_value)
+    return signatures
+
+
+def game_name_map(report: Dict[str, Any]) -> Dict[int, str]:
+    mapping: Dict[int, str] = {}
+    for game in report.get("all_games_snapshot", []):
+        game_id = game.get("game_id")
+        matchup = game.get("matchup")
+        if game_id is None:
+            continue
+        mapping[int(game_id)] = str(matchup or game_id)
+    return mapping
+
+
+def run_watch_mode(args: argparse.Namespace) -> int:
+    iteration = 0
+    previous_report: Optional[Dict[str, Any]] = None
+
+    while True:
+        iteration += 1
+        started = time.time()
+        try:
+            report = run_analysis(args)
+        except Exception as exc:
+            print(f"[watch][error] Iteration {iteration} failed: {exc}", file=sys.stderr)
+            if args.max_iterations and iteration >= args.max_iterations:
+                return 1
+            time.sleep(max(1, int(args.interval_seconds)))
+            continue
+
+        latest_path = args.latest_output or args.output
+        if latest_path:
+            write_report_json(report, latest_path)
+
+        archived_path = ""
+        if args.archive_dir:
+            ts = dt.datetime.now(tz=dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            archived_path = os.path.join(
+                args.archive_dir,
+                f"cbb_betting_report_{ts}.json",
+            )
+            write_report_json(report, archived_path)
+
+        current_ids = {int(g["game_id"]) for g in report.get("all_games_snapshot", [])}
+        current_signatures = market_signature_map(report)
+        current_game_names = game_name_map(report)
+
+        new_games: List[str] = []
+        removed_games: List[str] = []
+        changed_lines = 0
+        if previous_report is not None:
+            previous_ids = {
+                int(g["game_id"]) for g in previous_report.get("all_games_snapshot", [])
+            }
+            previous_names = game_name_map(previous_report)
+            previous_signatures = market_signature_map(previous_report)
+            new_ids = sorted(current_ids - previous_ids)
+            removed_ids = sorted(previous_ids - current_ids)
+
+            new_games = [current_game_names.get(game_id, str(game_id)) for game_id in new_ids]
+            removed_games = [previous_names.get(game_id, str(game_id)) for game_id in removed_ids]
+
+            shared_ids = previous_ids & current_ids
+            for game_id in shared_ids:
+                if previous_signatures.get(game_id) != current_signatures.get(game_id):
+                    changed_lines += 1
+
+        runtime = time.time() - started
+        print(
+            "[watch] iteration={iteration} games={games} "
+            "param1={p1} param2_spread={p2s} param2_total={p2t} param3={p3} "
+            "new_games={new_count} removed_games={removed_count} line_changes={line_changes} "
+            "runtime_sec={runtime:.1f}".format(
+                iteration=iteration,
+                games=len(report.get("all_games_snapshot", [])),
+                p1=len(report.get("parameter_1", [])),
+                p2s=len(report.get("parameter_2", {}).get("spread", [])),
+                p2t=len(report.get("parameter_2", {}).get("totals", [])),
+                p3=len(report.get("parameter_3", [])),
+                new_count=len(new_games),
+                removed_count=len(removed_games),
+                line_changes=changed_lines,
+                runtime=runtime,
+            )
+        )
+        if new_games:
+            print(f"[watch] new games: {', '.join(new_games[:10])}")
+        if removed_games:
+            print(f"[watch] removed games: {', '.join(removed_games[:10])}")
+        if latest_path:
+            print(f"[watch] latest report: {latest_path}")
+        if archived_path:
+            print(f"[watch] archived report: {archived_path}")
+
+        previous_report = report
+        if args.max_iterations and iteration >= args.max_iterations:
+            return 0
+
+        sleep_for = max(0.0, float(args.interval_seconds) - runtime)
+        time.sleep(sleep_for)
 
 
 def main(argv: List[str]) -> int:
     args = parse_args(argv)
+
+    if args.watch:
+        return run_watch_mode(args)
+
     try:
         report = run_analysis(args)
     except Exception as exc:
@@ -897,12 +1518,11 @@ def main(argv: List[str]) -> int:
 
     ts = dt.datetime.now(tz=dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     output_path = args.output or f"reports/cbb_betting_report_{ts}.json"
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    with open(output_path, "w", encoding="utf-8") as file_handle:
-        json.dump(report, file_handle, indent=2)
+    write_report_json(report, output_path)
 
     print(f"Report written to: {output_path}")
     print(f"Games captured: {len(report['all_games_snapshot'])}")
+    print(f"Model projections: {len(report['model_projections'])}")
     print(f"Parameter 1 picks: {len(report['parameter_1'])}")
     print(f"Parameter 2 spread picks: {len(report['parameter_2']['spread'])}")
     print(f"Parameter 2 total picks: {len(report['parameter_2']['totals'])}")
