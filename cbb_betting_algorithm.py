@@ -26,6 +26,7 @@ import re
 import sys
 import time
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -44,6 +45,8 @@ DEFAULT_REFRESH_INTERVAL_SECONDS = 120
 DEFAULT_HOME_COURT_ADVANTAGE = 2.7
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 20
 DEFAULT_REQUEST_RETRIES = 3
+DEFAULT_TIMEZONE = "America/New_York"
+DEFAULT_DAYS_AHEAD = 1
 
 INJURY_STATUS_WEIGHTS = {
     "out_for_season": 1.35,
@@ -68,6 +71,13 @@ def parse_iso(ts: str) -> dt.datetime:
     if ts.endswith("Z"):
         ts = ts[:-1] + "+00:00"
     return dt.datetime.fromisoformat(ts)
+
+
+def safe_timezone(name: str) -> dt.tzinfo:
+    try:
+        return ZoneInfo(name)
+    except Exception:
+        return dt.timezone.utc
 
 
 def clamp(value: float, low: float, high: float) -> float:
@@ -538,6 +548,53 @@ def fetch_board_data(
     # Graceful fallback: return empty board rather than raising.
     # The app layer can show cached/last-known data when this happens.
     return [], {}, {}
+
+
+def filter_games_by_day_window(
+    games: List[Dict[str, Any]],
+    *,
+    timezone_name: str,
+    day_start_offset: int,
+    days_ahead: int,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    tz = safe_timezone(timezone_name)
+    today_local = dt.datetime.now(tz).date()
+    start_date = today_local + dt.timedelta(days=max(0, day_start_offset))
+    end_date = start_date + dt.timedelta(days=max(0, days_ahead))
+
+    filtered: List[Dict[str, Any]] = []
+    for game in games:
+        start_time = game.get("start_time")
+        if not start_time:
+            continue
+        try:
+            local_dt = parse_iso(start_time).astimezone(tz)
+        except Exception:
+            continue
+        local_date = local_dt.date()
+        if not (start_date <= local_date <= end_date):
+            continue
+        game_copy = dict(game)
+        game_copy["_local_start_time"] = local_dt.isoformat()
+        game_copy["_local_date"] = local_date.isoformat()
+        game_copy["_day_offset"] = (local_date - today_local).days
+        if local_date == today_local:
+            day_bucket = "today"
+        elif local_date == today_local + dt.timedelta(days=1):
+            day_bucket = "tomorrow"
+        else:
+            day_bucket = f"day_{(local_date - today_local).days}"
+        game_copy["_day_bucket"] = day_bucket
+        filtered.append(game_copy)
+
+    filtered.sort(key=lambda g: g.get("start_time") or "")
+    window_meta = {
+        "timezone": timezone_name,
+        "today_local_date": today_local.isoformat(),
+        "window_start_local_date": start_date.isoformat(),
+        "window_end_local_date": end_date.isoformat(),
+    }
+    return filtered, window_meta
 
 
 def fetch_market_history(
@@ -1575,6 +1632,9 @@ def build_game_snapshot(
         "away_seed": extract_team_seed(teams["away"]),
         "home_seed": extract_team_seed(teams["home"]),
         "start_time_utc": game.get("start_time"),
+        "start_time_local": game.get("_local_start_time"),
+        "local_date": game.get("_local_date"),
+        "day_bucket": game.get("_day_bucket"),
         "num_bets": game.get("num_bets"),
         "books": books_snapshot,
     }
@@ -1583,11 +1643,17 @@ def build_game_snapshot(
 def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
     session = requests.Session()
 
-    games, all_books, game_links = fetch_board_data(
+    board_games, all_books, game_links = fetch_board_data(
         session,
         args.league,
         request_timeout=args.request_timeout,
         request_retries=args.request_retries,
+    )
+    games, day_window_meta = filter_games_by_day_window(
+        board_games,
+        timezone_name=args.timezone,
+        day_start_offset=args.day_start_offset,
+        days_ahead=args.days_ahead,
     )
     preferred_book_ids = [int(x) for x in args.book_ids.split(",") if x.strip()]
     include_model = bool(args.include_model)
@@ -1673,6 +1739,9 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
         analysis_book = pick_analysis_book(history_data, preferred_book_ids)
         matchup = f"{away_team_name} @ {home_team_name}"
         game_url = game_links.get(game_id)
+        local_start_time = game.get("_local_start_time")
+        local_date = game.get("_local_date")
+        day_bucket = game.get("_day_bucket")
         sportsbook = (
             get_book_name(all_books.get(analysis_book, {}))
             if analysis_book
@@ -1723,6 +1792,9 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
                     "away_seed": away_seed,
                     "home_seed": home_seed,
                     "start_time_utc": game.get("start_time"),
+                "start_time_local": local_start_time,
+                "local_date": local_date,
+                "day_bucket": day_bucket,
                     "game_url": game_url,
                     "analysis_sportsbook": sportsbook,
                     "analysis_book_id": int(analysis_book) if analysis_book else None,
@@ -1759,6 +1831,9 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
                         "away_seed": away_seed,
                         "home_seed": home_seed,
                         "start_time_utc": game.get("start_time"),
+                        "start_time_local": local_start_time,
+                        "local_date": local_date,
+                        "day_bucket": day_bucket,
                         "game_url": game_url,
                         "sportsbook": sportsbook,
                         "book_id": int(analysis_book),
@@ -1814,6 +1889,9 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
                         "away_seed": away_seed,
                         "home_seed": home_seed,
                         "start_time_utc": game.get("start_time"),
+                        "start_time_local": local_start_time,
+                        "local_date": local_date,
+                        "day_bucket": day_bucket,
                         "game_url": game_url,
                         "sportsbook": sportsbook,
                         "book_id": int(analysis_book),
@@ -1873,6 +1951,9 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
                         "away_seed": away_seed,
                         "home_seed": home_seed,
                         "start_time_utc": game.get("start_time"),
+                        "start_time_local": local_start_time,
+                        "local_date": local_date,
+                        "day_bucket": day_bucket,
                         "game_url": game_url,
                         "analysis_sportsbook": sportsbook,
                         "analysis_book_id": int(analysis_book),
@@ -1930,6 +2011,9 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
                         "away_seed": away_seed,
                         "home_seed": home_seed,
                         "start_time_utc": game.get("start_time"),
+                        "start_time_local": local_start_time,
+                        "local_date": local_date,
+                        "day_bucket": day_bucket,
                         "game_url": game_url,
                         "sportsbook": sportsbook,
                         "book_id": int(analysis_book),
@@ -1986,6 +2070,11 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
             "include_model": include_model,
             "include_advanced_triggers": include_advanced_triggers,
             "compact_output": bool(args.compact_output),
+            "day_window": day_window_meta,
+            "day_start_offset": args.day_start_offset,
+            "days_ahead": args.days_ahead,
+            "board_games_count": len(board_games),
+            "window_games_count": len(games),
             "preferred_book_ids": preferred_book_ids,
             "preferred_sportsbooks": [
                 {
@@ -2053,6 +2142,26 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
         choices=["money", "tickets"],
         default="money",
         help="Public split metric to evaluate (default: money).",
+    )
+    parser.add_argument(
+        "--timezone",
+        default=DEFAULT_TIMEZONE,
+        help=f"Timezone used for day windows (default: {DEFAULT_TIMEZONE}).",
+    )
+    parser.add_argument(
+        "--day-start-offset",
+        type=int,
+        default=0,
+        help="Start day offset from local today (default: 0).",
+    )
+    parser.add_argument(
+        "--days-ahead",
+        type=int,
+        default=DEFAULT_DAYS_AHEAD,
+        help=(
+            f"Days ahead from start offset to include (default: {DEFAULT_DAYS_AHEAD}). "
+            "0 means one local day only."
+        ),
     )
     parser.add_argument(
         "--book-ids",

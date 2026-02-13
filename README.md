@@ -78,6 +78,7 @@ Dashboard features:
   - Parameter 2
   - Parameter 3
   - All Picks
+- date scope selector: **Today + Tomorrow**, **Today**, or **Tomorrow**
 - game cards with matchup + recommended pick text
 - team seed display when available from feed
 - matchup filter
