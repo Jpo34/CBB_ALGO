@@ -50,6 +50,9 @@ def build_engine_args(config: Dict[str, Any]) -> argparse.Namespace:
         league=config["league"],
         public_threshold=config["public_threshold"],
         public_metric=config["public_metric"],
+        timezone=config["timezone"],
+        day_start_offset=config["day_start_offset"],
+        days_ahead=config["days_ahead"],
         book_ids=config["book_ids"],
         max_workers=config["max_workers"],
         include_model=False,
@@ -135,6 +138,10 @@ def normalize_parameter_entries(report: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "home_team": record.get("home_team"),
                 "away_seed": record.get("away_seed"),
                 "home_seed": record.get("home_seed"),
+                "start_time_utc": record.get("start_time_utc"),
+                "start_time_local": record.get("start_time_local"),
+                "local_date": record.get("local_date"),
+                "day_bucket": record.get("day_bucket"),
                 "bet_type": "spread",
                 "pick_identifier": team.lower(),
                 "pick_text": pick_text,
@@ -167,6 +174,10 @@ def normalize_parameter_entries(report: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "home_team": record.get("home_team"),
                 "away_seed": record.get("away_seed"),
                 "home_seed": record.get("home_seed"),
+                "start_time_utc": record.get("start_time_utc"),
+                "start_time_local": record.get("start_time_local"),
+                "local_date": record.get("local_date"),
+                "day_bucket": record.get("day_bucket"),
                 "bet_type": "spread",
                 "pick_identifier": team.lower(),
                 "pick_text": pick_text,
@@ -199,6 +210,10 @@ def normalize_parameter_entries(report: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "home_team": record.get("home_team"),
                 "away_seed": record.get("away_seed"),
                 "home_seed": record.get("home_seed"),
+                "start_time_utc": record.get("start_time_utc"),
+                "start_time_local": record.get("start_time_local"),
+                "local_date": record.get("local_date"),
+                "day_bucket": record.get("day_bucket"),
                 "bet_type": "total",
                 "pick_identifier": side.lower(),
                 "pick_text": pick_text,
@@ -251,6 +266,10 @@ def normalize_parameter_entries(report: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "home_team": record.get("home_team"),
                 "away_seed": record.get("away_seed"),
                 "home_seed": record.get("home_seed"),
+                "start_time_utc": record.get("start_time_utc"),
+                "start_time_local": record.get("start_time_local"),
+                "local_date": record.get("local_date"),
+                "day_bucket": record.get("day_bucket"),
                 "bet_type": bet_type,
                 "pick_identifier": pick_identifier,
                 "pick_text": pick_text,
@@ -359,6 +378,16 @@ def filter_matchup(entries: List[Dict[str, Any]], term: str) -> List[Dict[str, A
     return [entry for entry in entries if query in str(entry.get("matchup", "")).lower()]
 
 
+def filter_day_scope(entries: List[Dict[str, Any]], scope: str) -> List[Dict[str, Any]]:
+    if scope == "Today + Tomorrow":
+        return entries
+    if scope == "Today":
+        return [entry for entry in entries if entry.get("day_bucket") == "today"]
+    if scope == "Tomorrow":
+        return [entry for entry in entries if entry.get("day_bucket") == "tomorrow"]
+    return entries
+
+
 def render_pick_cards(entries: List[Dict[str, Any]], *, show_score: bool = False) -> None:
     if not entries:
         st.info("No picks match this view.")
@@ -368,6 +397,9 @@ def render_pick_cards(entries: List[Dict[str, Any]], *, show_score: bool = False
         with st.container(border=True):
             st.markdown(f"**{format_matchup(entry)}**")
             st.markdown(f"### Pick: {entry.get('pick_text', 'N/A')}")
+            local_tip = entry.get("start_time_local")
+            if local_tip:
+                st.caption(f"Tip-off (local): {local_tip}")
             line_parts = [
                 entry.get("parameter", ""),
                 str(entry.get("bet_type", "")).upper(),
@@ -435,6 +467,7 @@ def main() -> None:
         league = st.text_input("League", value="ncaab")
         public_threshold = st.slider("Public threshold (%)", 50.0, 95.0, 70.0, 1.0)
         public_metric = st.selectbox("Public metric", ["money", "tickets"], index=0)
+        day_scope = st.selectbox("Game scope", ["Today + Tomorrow", "Today", "Tomorrow"], index=0)
         selected_books = st.multiselect(
             "Sportsbooks",
             options=[book_id for book_id, _ in DEFAULT_BOOK_OPTIONS],
@@ -458,6 +491,7 @@ def main() -> None:
             max_workers = st.slider("Parallel workers", 1, 20, 8, 1)
             request_timeout = st.slider("Request timeout (sec)", 5, 40, 12, 1)
             request_retries = st.slider("Request retries", 1, 5, 2, 1)
+            timezone_name = st.text_input("Timezone", value="America/New_York")
             if advanced_triggers and fast_mode:
                 st.caption(
                     "Fast mode is auto-overridden when advanced triggers are enabled."
@@ -493,6 +527,9 @@ def main() -> None:
         "league": league.strip() or "ncaab",
         "public_threshold": float(public_threshold),
         "public_metric": public_metric,
+        "timezone": timezone_name.strip() or "America/New_York",
+        "day_start_offset": 0 if day_scope != "Tomorrow" else 1,
+        "days_ahead": 1 if day_scope == "Today + Tomorrow" else 0,
         "book_ids": ",".join(str(book_id) for book_id in selected_books),
         "max_workers": int(max_workers),
         "include_advanced_triggers": bool(advanced_triggers),
@@ -584,13 +621,18 @@ def main() -> None:
 
     st.caption(
         "Generated: {generated} | Metric: {metric} | Threshold: {threshold}% | "
-        "Books: {books} | Advanced triggers: {advanced}".format(
+        "Books: {books} | Advanced triggers: {advanced} | Scope: {scope} ({window})".format(
             generated=metadata.get("generated_at_utc", "unknown"),
             metric=metadata.get("public_metric", "unknown"),
             threshold=metadata.get("public_threshold_pct", "unknown"),
             books=", ".join(str(x) for x in metadata.get("preferred_book_ids", [])),
             advanced=(
                 "on" if metadata.get("include_advanced_triggers", False) else "off"
+            ),
+            scope=day_scope,
+            window=(
+                f"{(metadata.get('day_window') or {}).get('window_start_local_date', '?')} -> "
+                f"{(metadata.get('day_window') or {}).get('window_end_local_date', '?')}"
             ),
         )
     )
@@ -601,7 +643,9 @@ def main() -> None:
     min_score = filter_col2.slider("Top bets min score", 1, 3, 1, 1)
 
     filtered_entries = filter_matchup(entries, matchup_filter)
+    filtered_entries = filter_day_scope(filtered_entries, day_scope)
     filtered_top = filter_matchup(top_recommendations, matchup_filter)
+    filtered_top = filter_day_scope(filtered_top, day_scope)
     filtered_top = [
         entry for entry in filtered_top if int(entry.get("recommendation_score", 0)) >= min_score
     ]
