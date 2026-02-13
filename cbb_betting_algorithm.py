@@ -920,6 +920,120 @@ def total_pick_model_alignment(
     }
 
 
+def spread_points_against_side(
+    *, open_value: float, current_value: float
+) -> float:
+    # For favorites (negative line), less negative is worse for that side.
+    if open_value < 0:
+        return max(0.0, abs(open_value) - abs(current_value))
+    # For underdogs (positive line), fewer points is worse.
+    return max(0.0, open_value - current_value)
+
+
+def spread_rlm_points_against_public(spread_summary: Dict[str, Any]) -> float:
+    public_side = spread_summary.get("heavy_public_side")
+    if public_side not in ("home", "away"):
+        return 0.0
+    opening = spread_summary["lines"][public_side]["opening"]["line"]
+    current = spread_summary["lines"][public_side]["current"]["line"]
+    return round(
+        spread_points_against_side(
+            open_value=float(opening),
+            current_value=float(current),
+        ),
+        3,
+    )
+
+
+def total_rlm_points_against_public(total_summary: Dict[str, Any]) -> float:
+    public_side = total_summary.get("heavy_public_side")
+    if public_side == "over":
+        return round(
+            max(0.0, float(total_summary["open_total"]) - float(total_summary["current_total"])),
+            3,
+        )
+    if public_side == "under":
+        return round(
+            max(0.0, float(total_summary["current_total"]) - float(total_summary["open_total"])),
+            3,
+        )
+    return 0.0
+
+
+def count_spread_book_confirmations(
+    *,
+    history_data: Dict[str, Any],
+    public_side: str,
+    min_points: float,
+) -> Tuple[int, List[int]]:
+    confirmations: List[int] = []
+    for book_id, book_data in history_data.items():
+        event = book_data.get("event", {})
+        spread = event.get("spread") or []
+        side_map = by_side(spread)
+        public_outcome = side_map.get(public_side)
+        if not public_outcome:
+            continue
+        opening, current = get_open_current(public_outcome)
+        if not opening or not current:
+            continue
+        points = spread_points_against_side(
+            open_value=float(opening["value"]),
+            current_value=float(current["value"]),
+        )
+        if points >= min_points:
+            try:
+                confirmations.append(int(book_id))
+            except (TypeError, ValueError):
+                continue
+    return len(confirmations), confirmations
+
+
+def count_total_book_confirmations(
+    *,
+    history_data: Dict[str, Any],
+    public_side: str,
+    min_points: float,
+) -> Tuple[int, List[int]]:
+    confirmations: List[int] = []
+    for book_id, book_data in history_data.items():
+        event = book_data.get("event", {})
+        total = event.get("total") or []
+        side_map = by_side(total)
+        over_outcome = side_map.get("over")
+        under_outcome = side_map.get("under")
+        if not over_outcome or not under_outcome:
+            continue
+        over_open, over_current = get_open_current(over_outcome)
+        if not over_open or not over_current:
+            continue
+        open_total = float(over_open["value"])
+        current_total = float(over_current["value"])
+        if public_side == "over":
+            points = max(0.0, open_total - current_total)
+        elif public_side == "under":
+            points = max(0.0, current_total - open_total)
+        else:
+            continue
+        if points >= min_points:
+            try:
+                confirmations.append(int(book_id))
+            except (TypeError, ValueError):
+                continue
+    return len(confirmations), confirmations
+
+
+def hours_to_tipoff(start_time_utc: Optional[str], line_update_utc: Optional[str]) -> Optional[float]:
+    if not start_time_utc or not line_update_utc:
+        return None
+    try:
+        tip = parse_iso(start_time_utc)
+        line_time = parse_iso(line_update_utc)
+    except Exception:
+        return None
+    return (tip - line_time).total_seconds() / 3600.0
+
+
 def get_record_entry(
     detail_context: Dict[str, Any], side: str, record_type: str
 ) -> Optional[Dict[str, Any]]:
@@ -1658,6 +1772,8 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
     preferred_book_ids = [int(x) for x in args.book_ids.split(",") if x.strip()]
     include_model = bool(args.include_model)
     include_advanced_triggers = bool(args.include_advanced_triggers)
+    include_totals = bool(args.include_totals)
+    enable_alt_automation = bool(args.enable_alt_automation)
 
     histories: Dict[int, Dict[str, Any]] = {}
     detail_contexts: Dict[int, Dict[str, Any]] = {}
@@ -1880,6 +1996,34 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
                 fade_team = teams[fade_side]["display_name"]
                 fade_line = spread_summary["lines"][fade_side]["current"]["line"]
                 fade_odds = spread_summary["lines"][fade_side]["current"]["odds"]
+
+                rlm_points = spread_rlm_points_against_public(spread_summary)
+                rlm_is_strong = rlm_points >= args.rlm_strong_points
+                rlm_min_ok = rlm_points >= args.rlm_min_points
+                book_confirm_count, book_confirmations = count_spread_book_confirmations(
+                    history_data=history_data,
+                    public_side=spread_summary["heavy_public_side"],
+                    min_points=args.rlm_min_points,
+                )
+                book_confirmation_ok = (
+                    book_confirm_count >= args.rlm_min_book_confirmations
+                )
+                tipoff_hours = hours_to_tipoff(
+                    game.get("start_time"),
+                    spread_summary.get("last_update_utc"),
+                )
+                timing_ok = (
+                    tipoff_hours is not None and tipoff_hours <= args.rlm_late_hours
+                )
+
+                pick_is_favorite = float(fade_line) < 0
+                favorite_filter_ok = (not pick_is_favorite) or rlm_is_strong
+                core_rlm_qualified = (
+                    rlm_min_ok and book_confirmation_ok and timing_ok and favorite_filter_ok
+                )
+                if not core_rlm_qualified:
+                    continue
+
                 parameter_2_spread.append(
                     {
                         "game_id": game_id,
@@ -1911,6 +2055,25 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
                             "line": fade_line,
                             "odds": fade_odds,
                         },
+                        "is_underdog_pick": bool(float(fade_line) > 0),
+                        "is_home_underdog_pick": bool(
+                            float(fade_line) > 0 and fade_side == "home"
+                        ),
+                        "pick_is_favorite": pick_is_favorite,
+                        "rlm_points": rlm_points,
+                        "rlm_min_required": args.rlm_min_points,
+                        "rlm_strong_threshold": args.rlm_strong_points,
+                        "rlm_is_strong": rlm_is_strong,
+                        "rlm_book_confirmations": book_confirmations,
+                        "rlm_book_confirmation_count": book_confirm_count,
+                        "rlm_book_confirmation_min": args.rlm_min_book_confirmations,
+                        "rlm_book_confirmation_ok": book_confirmation_ok,
+                        "rlm_timing_hours_to_tip": round(tipoff_hours, 3)
+                        if tipoff_hours is not None
+                        else None,
+                        "rlm_timing_late_hours_threshold": args.rlm_late_hours,
+                        "rlm_timing_ok": timing_ok,
+                        "core_rlm_qualified": core_rlm_qualified,
                         "season_alignment": season_alignment_for_pick_side(
                             fade_side,
                             season_context,
@@ -1942,66 +2105,107 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
                     target_high=args.alt_target_high,
                     target_mid=args.alt_target_mid,
                 )
-                parameter_3.append(
-                    {
-                        "game_id": game_id,
-                        "matchup": matchup,
-                        "away_team": away_team_name,
-                        "home_team": home_team_name,
-                        "away_seed": away_seed,
-                        "home_seed": home_seed,
-                        "start_time_utc": game.get("start_time"),
-                        "start_time_local": local_start_time,
-                        "local_date": local_date,
-                        "day_bucket": day_bucket,
-                        "game_url": game_url,
-                        "analysis_sportsbook": sportsbook,
-                        "analysis_book_id": int(analysis_book),
-                        "line_release_utc": spread_summary["release_utc"],
-                        "line_last_update_utc": spread_summary["last_update_utc"],
-                        "trigger": {
-                            "public_side": spread_summary["heavy_public_team"],
-                            "public_pct": spread_summary["heavy_public_pct"],
-                            "public_metric": spread_summary["public_metric"],
-                            "favorite_team": spread_summary["favorite_team"],
-                            "favorite_open_spread": spread_summary["favorite_open_spread"],
-                            "favorite_current_spread": spread_summary["favorite_current_spread"],
-                            "movement_against_public": spread_summary["movement_against_public"],
-                        },
-                        "base_pick": {
-                            "market": "spread",
-                            "side": fade_side,
-                            "team": fade_team,
-                            "line": fade_line,
-                            "odds": fade_odds,
-                        },
-                        "season_alignment": season_alignment_for_pick_side(
-                            fade_side,
-                            season_context,
-                        ),
-                        "safer_alternate_pick": alt_pick,
-                        "target_odds_window": {
-                            "min": args.alt_target_low,
-                            "max": args.alt_target_high,
-                            "midpoint": args.alt_target_mid,
-                        },
-                    }
-                )
-                if include_model:
-                    parameter_3[-1]["model_alignment"] = spread_pick_model_alignment(
-                        model_edges,
-                        fade_side,
+                if enable_alt_automation:
+                    parameter_3.append(
+                        {
+                            "game_id": game_id,
+                            "matchup": matchup,
+                            "away_team": away_team_name,
+                            "home_team": home_team_name,
+                            "away_seed": away_seed,
+                            "home_seed": home_seed,
+                            "start_time_utc": game.get("start_time"),
+                            "start_time_local": local_start_time,
+                            "local_date": local_date,
+                            "day_bucket": day_bucket,
+                            "game_url": game_url,
+                            "analysis_sportsbook": sportsbook,
+                            "analysis_book_id": int(analysis_book),
+                            "line_release_utc": spread_summary["release_utc"],
+                            "line_last_update_utc": spread_summary["last_update_utc"],
+                            "trigger": {
+                                "public_side": spread_summary["heavy_public_team"],
+                                "public_pct": spread_summary["heavy_public_pct"],
+                                "public_metric": spread_summary["public_metric"],
+                                "favorite_team": spread_summary["favorite_team"],
+                                "favorite_open_spread": spread_summary["favorite_open_spread"],
+                                "favorite_current_spread": spread_summary["favorite_current_spread"],
+                                "movement_against_public": spread_summary["movement_against_public"],
+                            },
+                            "base_pick": {
+                                "market": "spread",
+                                "side": fade_side,
+                                "team": fade_team,
+                                "line": fade_line,
+                                "odds": fade_odds,
+                            },
+                            "is_underdog_pick": bool(float(fade_line) > 0),
+                            "is_home_underdog_pick": bool(
+                                float(fade_line) > 0 and fade_side == "home"
+                            ),
+                            "pick_is_favorite": pick_is_favorite,
+                            "rlm_points": rlm_points,
+                            "rlm_min_required": args.rlm_min_points,
+                            "rlm_strong_threshold": args.rlm_strong_points,
+                            "rlm_is_strong": rlm_is_strong,
+                            "rlm_book_confirmations": book_confirmations,
+                            "rlm_book_confirmation_count": book_confirm_count,
+                            "rlm_book_confirmation_min": args.rlm_min_book_confirmations,
+                            "rlm_book_confirmation_ok": book_confirmation_ok,
+                            "rlm_timing_hours_to_tip": round(tipoff_hours, 3)
+                            if tipoff_hours is not None
+                            else None,
+                            "rlm_timing_late_hours_threshold": args.rlm_late_hours,
+                            "rlm_timing_ok": timing_ok,
+                            "core_rlm_qualified": core_rlm_qualified,
+                            "season_alignment": season_alignment_for_pick_side(
+                                fade_side,
+                                season_context,
+                            ),
+                            "safer_alternate_pick": alt_pick,
+                            "target_odds_window": {
+                                "min": args.alt_target_low,
+                                "max": args.alt_target_high,
+                                "midpoint": args.alt_target_mid,
+                            },
+                        }
                     )
+                    if include_model:
+                        parameter_3[-1]["model_alignment"] = spread_pick_model_alignment(
+                            model_edges,
+                            fade_side,
+                        )
 
         # ----------------------------
         # Parameter 2 (Totals)
         # If public is heavy on over/under and total moves opposite, fade public side.
         # ----------------------------
-        if total_summary and total_summary["heavy_public_side"]:
+        if include_totals and total_summary and total_summary["heavy_public_side"]:
             if total_summary["has_moved"] and total_summary["movement_against_public"]:
                 fade_side = choose_opposite_side(total_summary["heavy_public_side"])
                 fade_line = total_summary["lines"][fade_side]["current"]["line"]
                 fade_odds = total_summary["lines"][fade_side]["current"]["odds"]
+                rlm_points_total = total_rlm_points_against_public(total_summary)
+                rlm_min_ok_total = rlm_points_total >= args.rlm_min_points
+                total_book_confirm_count, total_book_confirmations = count_total_book_confirmations(
+                    history_data=history_data,
+                    public_side=total_summary["heavy_public_side"],
+                    min_points=args.rlm_min_points,
+                )
+                total_book_ok = (
+                    total_book_confirm_count >= args.rlm_min_book_confirmations
+                )
+                tipoff_hours_total = hours_to_tipoff(
+                    game.get("start_time"),
+                    total_summary.get("last_update_utc"),
+                )
+                timing_ok_total = (
+                    tipoff_hours_total is not None
+                    and tipoff_hours_total <= args.rlm_late_hours
+                )
+                if not (rlm_min_ok_total and total_book_ok and timing_ok_total):
+                    continue
+
                 parameter_2_total.append(
                     {
                         "game_id": game_id,
@@ -2031,6 +2235,17 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
                             "line": fade_line,
                             "odds": fade_odds,
                         },
+                        "rlm_points": rlm_points_total,
+                        "rlm_min_required": args.rlm_min_points,
+                        "rlm_book_confirmations": total_book_confirmations,
+                        "rlm_book_confirmation_count": total_book_confirm_count,
+                        "rlm_book_confirmation_min": args.rlm_min_book_confirmations,
+                        "rlm_book_confirmation_ok": total_book_ok,
+                        "rlm_timing_hours_to_tip": round(tipoff_hours_total, 3)
+                        if tipoff_hours_total is not None
+                        else None,
+                        "rlm_timing_late_hours_threshold": args.rlm_late_hours,
+                        "rlm_timing_ok": timing_ok_total,
                         "season_context": season_context_for_total(
                             season_context,
                             fade_side,
@@ -2069,6 +2284,8 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
             "request_retries": args.request_retries,
             "include_model": include_model,
             "include_advanced_triggers": include_advanced_triggers,
+            "include_totals": include_totals,
+            "enable_alt_automation": enable_alt_automation,
             "compact_output": bool(args.compact_output),
             "day_window": day_window_meta,
             "day_start_offset": args.day_start_offset,
@@ -2095,6 +2312,16 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
                     "Advanced trigger pack uses last_10, top_25/over_500 proxy, venue split, and ATS momentum."
                     if include_advanced_triggers
                     else "Advanced trigger pack disabled."
+                ),
+                (
+                    "Totals triggers are enabled."
+                    if include_totals
+                    else "Totals triggers are disabled for core spread-focused testing."
+                ),
+                (
+                    "Automatic alternate-line switching is enabled."
+                    if enable_alt_automation
+                    else "Automatic alternate-line switching is disabled (manual-only)."
                 ),
                 (
                     "Model projections use trend and injury context from each game detail page."
@@ -2186,8 +2413,44 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     parser.add_argument(
         "--include-advanced-triggers",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="Enable advanced trend triggers (last10/top-tier/venue/ATS) for pick scoring.",
+    )
+    parser.add_argument(
+        "--include-totals",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Include totals-based parameter triggers (default: off).",
+    )
+    parser.add_argument(
+        "--enable-alt-automation",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable automatic Parameter 3 alternate-line switching (default: off).",
+    )
+    parser.add_argument(
+        "--rlm-min-points",
+        type=float,
+        default=1.5,
+        help="Minimum points of reverse line movement required (default: 1.5).",
+    )
+    parser.add_argument(
+        "--rlm-strong-points",
+        type=float,
+        default=2.0,
+        help="Strong reverse line movement threshold in points (default: 2.0).",
+    )
+    parser.add_argument(
+        "--rlm-late-hours",
+        type=float,
+        default=6.0,
+        help="Timing filter: RLM must occur within this many hours to tip-off (default: 6).",
+    )
+    parser.add_argument(
+        "--rlm-min-book-confirmations",
+        type=int,
+        default=2,
+        help="Minimum sportsbook confirmations for RLM signal (default: 2).",
     )
     parser.add_argument(
         "--compact-output",
