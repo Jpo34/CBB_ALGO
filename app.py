@@ -498,7 +498,7 @@ def main() -> None:
                 )
 
         st.subheader("Refresh")
-        auto_refresh = st.toggle("Auto-refresh", value=True)
+        auto_refresh = st.toggle("Auto-refresh", value=False)
         refresh_seconds = st.slider("Refresh every (sec)", 15, 600, 120, 15)
         manual_refresh = st.button("Refresh now")
 
@@ -517,11 +517,17 @@ def main() -> None:
         if st_autorefresh is None:
             st.warning("Install `streamlit-autorefresh` to enable auto-refresh.")
         else:
-            ticks = st_autorefresh(
-                interval=int(refresh_seconds * 1000),
-                key="cbb_refresh_simple",
-            )
-            refresh_key += int(ticks)
+            try:
+                ticks = st_autorefresh(
+                    interval=int(refresh_seconds * 1000),
+                    key="cbb_refresh_simple",
+                )
+                refresh_key += int(ticks)
+            except Exception as exc:
+                st.warning(
+                    "Auto-refresh component failed in this deployment. "
+                    f"Falling back to manual refresh. ({exc})"
+                )
 
     config = {
         "league": league.strip() or "ncaab",
