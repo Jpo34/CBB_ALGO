@@ -57,6 +57,12 @@ def build_engine_args(config: Dict[str, Any]) -> argparse.Namespace:
         max_workers=config["max_workers"],
         include_model=False,
         include_advanced_triggers=config["include_advanced_triggers"],
+        include_totals=False,
+        enable_alt_automation=False,
+        rlm_min_points=1.5,
+        rlm_strong_points=2.0,
+        rlm_late_hours=6.0,
+        rlm_min_book_confirmations=2,
         compact_output=True,
         skip_detail_context=config["skip_detail_context"],
         request_timeout=config["request_timeout"],
@@ -147,6 +153,12 @@ def normalize_parameter_entries(report: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "pick_text": pick_text,
                 "sportsbook": record.get("sportsbook"),
                 "public_pct": record.get("public_pct"),
+                "is_underdog_pick": record.get("is_underdog_pick"),
+                "is_home_underdog_pick": record.get("is_home_underdog_pick"),
+                "rlm_points": record.get("rlm_points"),
+                "rlm_book_confirmation_count": record.get("rlm_book_confirmation_count"),
+                "rlm_timing_ok": record.get("rlm_timing_ok"),
+                "core_rlm_qualified": record.get("core_rlm_qualified"),
                 "season_edge": season.get("season_edge"),
                 "season_support": season.get("supports_pick"),
                 "season_pick_record": season.get("pick_team_record"),
@@ -183,6 +195,12 @@ def normalize_parameter_entries(report: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "pick_text": pick_text,
                 "sportsbook": record.get("sportsbook"),
                 "public_pct": record.get("public_pct"),
+                "is_underdog_pick": record.get("is_underdog_pick"),
+                "is_home_underdog_pick": record.get("is_home_underdog_pick"),
+                "rlm_points": record.get("rlm_points"),
+                "rlm_book_confirmation_count": record.get("rlm_book_confirmation_count"),
+                "rlm_timing_ok": record.get("rlm_timing_ok"),
+                "core_rlm_qualified": record.get("core_rlm_qualified"),
                 "season_edge": season.get("season_edge"),
                 "season_support": season.get("supports_pick"),
                 "season_pick_record": season.get("pick_team_record"),
@@ -219,6 +237,12 @@ def normalize_parameter_entries(report: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "pick_text": pick_text,
                 "sportsbook": record.get("sportsbook"),
                 "public_pct": record.get("public_pct"),
+                "is_underdog_pick": record.get("is_underdog_pick"),
+                "is_home_underdog_pick": record.get("is_home_underdog_pick"),
+                "rlm_points": record.get("rlm_points"),
+                "rlm_book_confirmation_count": record.get("rlm_book_confirmation_count"),
+                "rlm_timing_ok": record.get("rlm_timing_ok"),
+                "core_rlm_qualified": record.get("core_rlm_qualified"),
                 "season_edge": None,
                 "season_support": None,
                 "season_pick_record": season.get("home_record"),
@@ -275,6 +299,12 @@ def normalize_parameter_entries(report: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "pick_text": pick_text,
                 "sportsbook": sportsbook,
                 "public_pct": trigger.get("public_pct"),
+                "is_underdog_pick": record.get("is_underdog_pick"),
+                "is_home_underdog_pick": record.get("is_home_underdog_pick"),
+                "rlm_points": record.get("rlm_points"),
+                "rlm_book_confirmation_count": record.get("rlm_book_confirmation_count"),
+                "rlm_timing_ok": record.get("rlm_timing_ok"),
+                "core_rlm_qualified": record.get("core_rlm_qualified"),
                 "season_edge": season.get("season_edge"),
                 "season_support": season.get("supports_pick"),
                 "season_pick_record": season.get("pick_team_record"),
@@ -296,6 +326,8 @@ def aggregate_top_recommendations(entries: List[Dict[str, Any]]) -> List[Dict[st
     season_edge_values: Dict[Tuple[Any, str, str], List[float]] = defaultdict(list)
     season_support_votes: Dict[Tuple[Any, str, str], int] = defaultdict(int)
     advanced_score_values: Dict[Tuple[Any, str, str], List[float]] = defaultdict(list)
+    underdog_votes: Dict[Tuple[Any, str, str], int] = defaultdict(int)
+    home_underdog_votes: Dict[Tuple[Any, str, str], int] = defaultdict(int)
 
     for entry in entries:
         key = (
@@ -322,6 +354,10 @@ def aggregate_top_recommendations(entries: List[Dict[str, Any]]) -> List[Dict[st
         advanced_score = entry.get("advanced_score")
         if isinstance(advanced_score, (int, float)):
             advanced_score_values[key].append(float(advanced_score))
+        if entry.get("is_underdog_pick") is True:
+            underdog_votes[key] += 1
+        if entry.get("is_home_underdog_pick") is True:
+            home_underdog_votes[key] += 1
 
     output: List[Dict[str, Any]] = []
     for key, item in grouped.items():
@@ -334,11 +370,11 @@ def aggregate_top_recommendations(entries: List[Dict[str, Any]]) -> List[Dict[st
         support_vote = season_support_votes[key]
         season_bonus = 0.0
         if support_vote > 0:
-            season_bonus += 0.5
+            season_bonus += 0.1
         elif support_vote < 0:
-            season_bonus -= 0.5
+            season_bonus -= 0.1
         if avg_season_edge is not None:
-            season_bonus += max(-0.5, min(0.5, avg_season_edge * 2.0))
+            season_bonus += max(-0.15, min(0.15, avg_season_edge * 0.75))
         advanced_values = advanced_score_values[key]
         avg_advanced_score = (
             sum(advanced_values) / len(advanced_values) if advanced_values else None
@@ -346,6 +382,11 @@ def aggregate_top_recommendations(entries: List[Dict[str, Any]]) -> List[Dict[st
         advanced_bonus = 0.0
         if avg_advanced_score is not None:
             advanced_bonus += max(-1.0, min(1.0, avg_advanced_score * 0.4))
+        underdog_bonus = 0.0
+        if underdog_votes[key] > 0:
+            underdog_bonus += 0.2
+        if home_underdog_votes[key] > 0:
+            underdog_bonus += 0.15
         item["parameters_triggered"] = params
         item["average_public_pct"] = round(avg_public, 2) if avg_public is not None else None
         item["recommendation_score"] = score
@@ -357,7 +398,11 @@ def aggregate_top_recommendations(entries: List[Dict[str, Any]]) -> List[Dict[st
         )
         item["season_bonus"] = round(season_bonus, 3)
         item["advanced_bonus"] = round(advanced_bonus, 3)
-        item["combined_score"] = round(score + season_bonus + advanced_bonus, 3)
+        item["underdog_bonus"] = round(underdog_bonus, 3)
+        item["combined_score"] = round(
+            score + season_bonus + advanced_bonus + underdog_bonus,
+            3,
+        )
         output.append(item)
 
     output.sort(
