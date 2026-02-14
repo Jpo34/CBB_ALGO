@@ -63,6 +63,16 @@ def build_engine_args(config: Dict[str, Any]) -> argparse.Namespace:
         rlm_strong_points=2.0,
         rlm_late_hours=6.0,
         rlm_min_book_confirmations=2,
+        true_line_min_edge_points=float(config.get("true_line_min_edge_points", 2.0)),
+        cover_probability_scale=5.0,
+        min_probability_edge=float(config.get("min_probability_edge", 0.03)),
+        min_liquidity_bets=float(config.get("min_liquidity_bets", 500.0)),
+        avoid_big_favorite_points=10.0,
+        big_favorite_min_edge=3.5,
+        key_number_buffer=0.35,
+        key_number_extra_edge=0.75,
+        underdogs_only=bool(config.get("underdogs_only", False)),
+        flat_bet_units=1.0,
         compact_output=True,
         skip_detail_context=config["skip_detail_context"],
         request_timeout=config["request_timeout"],
@@ -159,6 +169,10 @@ def normalize_parameter_entries(report: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "rlm_book_confirmation_count": record.get("rlm_book_confirmation_count"),
                 "rlm_timing_ok": record.get("rlm_timing_ok"),
                 "core_rlm_qualified": record.get("core_rlm_qualified"),
+                "true_line_gap_points": record.get("true_line_gap_points"),
+                "probability_edge": record.get("probability_edge"),
+                "model_cover_probability": record.get("model_cover_probability"),
+                "implied_probability": record.get("implied_probability"),
                 "season_edge": season.get("season_edge"),
                 "season_support": season.get("supports_pick"),
                 "season_pick_record": season.get("pick_team_record"),
@@ -201,6 +215,10 @@ def normalize_parameter_entries(report: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "rlm_book_confirmation_count": record.get("rlm_book_confirmation_count"),
                 "rlm_timing_ok": record.get("rlm_timing_ok"),
                 "core_rlm_qualified": record.get("core_rlm_qualified"),
+                "true_line_gap_points": record.get("true_line_gap_points"),
+                "probability_edge": record.get("probability_edge"),
+                "model_cover_probability": record.get("model_cover_probability"),
+                "implied_probability": record.get("implied_probability"),
                 "season_edge": season.get("season_edge"),
                 "season_support": season.get("supports_pick"),
                 "season_pick_record": season.get("pick_team_record"),
@@ -305,6 +323,15 @@ def normalize_parameter_entries(report: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "rlm_book_confirmation_count": record.get("rlm_book_confirmation_count"),
                 "rlm_timing_ok": record.get("rlm_timing_ok"),
                 "core_rlm_qualified": record.get("core_rlm_qualified"),
+                "true_line_gap_points": record.get("true_line_gap_points"),
+                "probability_edge": record.get("probability_edge"),
+                "model_cover_probability": record.get("model_cover_probability"),
+                "implied_probability": record.get("implied_probability"),
+                "portfolio_score": record.get("portfolio_score"),
+                "num_bets": record.get("num_bets"),
+                "major_market_game": record.get("major_market_game"),
+                "key_number_risk": record.get("key_number_risk"),
+                "low_liquidity_filtered": record.get("low_liquidity_filtered"),
                 "season_edge": season.get("season_edge"),
                 "season_support": season.get("supports_pick"),
                 "season_pick_record": season.get("pick_team_record"),
@@ -312,7 +339,7 @@ def normalize_parameter_entries(report: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "advanced_score": record.get("advanced_trigger_score"),
                 "advanced_support": record.get("advanced_trigger_support"),
                 "advanced_hits": record.get("advanced_trigger_hits"),
-                "reason": "Safer alternate-style version of the spread signal.",
+                "reason": record.get("reason"),
             }
         )
 
@@ -326,6 +353,9 @@ def aggregate_top_recommendations(entries: List[Dict[str, Any]]) -> List[Dict[st
     season_edge_values: Dict[Tuple[Any, str, str], List[float]] = defaultdict(list)
     season_support_votes: Dict[Tuple[Any, str, str], int] = defaultdict(int)
     advanced_score_values: Dict[Tuple[Any, str, str], List[float]] = defaultdict(list)
+    true_line_edge_values: Dict[Tuple[Any, str, str], List[float]] = defaultdict(list)
+    probability_edge_values: Dict[Tuple[Any, str, str], List[float]] = defaultdict(list)
+    portfolio_score_values: Dict[Tuple[Any, str, str], List[float]] = defaultdict(list)
     underdog_votes: Dict[Tuple[Any, str, str], int] = defaultdict(int)
     home_underdog_votes: Dict[Tuple[Any, str, str], int] = defaultdict(int)
 
@@ -354,6 +384,15 @@ def aggregate_top_recommendations(entries: List[Dict[str, Any]]) -> List[Dict[st
         advanced_score = entry.get("advanced_score")
         if isinstance(advanced_score, (int, float)):
             advanced_score_values[key].append(float(advanced_score))
+        true_line_gap_points = entry.get("true_line_gap_points")
+        if isinstance(true_line_gap_points, (int, float)):
+            true_line_edge_values[key].append(float(true_line_gap_points))
+        probability_edge = entry.get("probability_edge")
+        if isinstance(probability_edge, (int, float)):
+            probability_edge_values[key].append(float(probability_edge))
+        portfolio_score = entry.get("portfolio_score")
+        if isinstance(portfolio_score, (int, float)):
+            portfolio_score_values[key].append(float(portfolio_score))
         if entry.get("is_underdog_pick") is True:
             underdog_votes[key] += 1
         if entry.get("is_home_underdog_pick") is True:
@@ -382,6 +421,29 @@ def aggregate_top_recommendations(entries: List[Dict[str, Any]]) -> List[Dict[st
         advanced_bonus = 0.0
         if avg_advanced_score is not None:
             advanced_bonus += max(-1.0, min(1.0, avg_advanced_score * 0.4))
+        true_line_values = true_line_edge_values[key]
+        avg_true_line_edge = (
+            sum(true_line_values) / len(true_line_values) if true_line_values else None
+        )
+        true_line_bonus = 0.0
+        if avg_true_line_edge is not None:
+            true_line_bonus += max(0.0, min(1.5, avg_true_line_edge / 3.0))
+        probability_values = probability_edge_values[key]
+        avg_probability_edge = (
+            sum(probability_values) / len(probability_values)
+            if probability_values
+            else None
+        )
+        probability_bonus = 0.0
+        if avg_probability_edge is not None:
+            probability_bonus += max(-0.5, min(1.2, avg_probability_edge * 12.0))
+        portfolio_values = portfolio_score_values[key]
+        avg_portfolio_score = (
+            sum(portfolio_values) / len(portfolio_values) if portfolio_values else None
+        )
+        portfolio_bonus = 0.0
+        if avg_portfolio_score is not None:
+            portfolio_bonus += max(-0.3, min(1.0, avg_portfolio_score / 8.0))
         underdog_bonus = 0.0
         if underdog_votes[key] > 0:
             underdog_bonus += 0.2
@@ -396,11 +458,29 @@ def aggregate_top_recommendations(entries: List[Dict[str, Any]]) -> List[Dict[st
         item["average_advanced_score"] = (
             round(avg_advanced_score, 3) if avg_advanced_score is not None else None
         )
+        item["average_true_line_edge"] = (
+            round(avg_true_line_edge, 3) if avg_true_line_edge is not None else None
+        )
+        item["average_probability_edge"] = (
+            round(avg_probability_edge, 4) if avg_probability_edge is not None else None
+        )
+        item["average_portfolio_score"] = (
+            round(avg_portfolio_score, 3) if avg_portfolio_score is not None else None
+        )
         item["season_bonus"] = round(season_bonus, 3)
         item["advanced_bonus"] = round(advanced_bonus, 3)
+        item["true_line_bonus"] = round(true_line_bonus, 3)
+        item["probability_bonus"] = round(probability_bonus, 3)
+        item["portfolio_bonus"] = round(portfolio_bonus, 3)
         item["underdog_bonus"] = round(underdog_bonus, 3)
         item["combined_score"] = round(
-            score + season_bonus + advanced_bonus + underdog_bonus,
+            score
+            + season_bonus
+            + advanced_bonus
+            + true_line_bonus
+            + probability_bonus
+            + portfolio_bonus
+            + underdog_bonus,
             3,
         )
         output.append(item)
@@ -466,6 +546,19 @@ def render_pick_cards(entries: List[Dict[str, Any]], *, show_score: bool = False
                     record_text = f" | Records: {pick_record} vs {opp_record}"
                 st.caption(f"Season edge: {season_edge} ({season_flag}){record_text}")
 
+            true_line_gap = entry.get("true_line_gap_points")
+            if true_line_gap is not None:
+                model_prob = entry.get("model_cover_probability")
+                implied_prob = entry.get("implied_probability")
+                probability_edge = entry.get("probability_edge")
+                line_text = f"True-line edge: {true_line_gap} pts"
+                if model_prob is not None and implied_prob is not None:
+                    line_text += f" | Model: {round(float(model_prob) * 100, 1)}%"
+                    line_text += f" vs Implied: {round(float(implied_prob) * 100, 1)}%"
+                if probability_edge is not None:
+                    line_text += f" | Prob edge: {round(float(probability_edge) * 100, 2)}%"
+                st.caption(line_text)
+
             advanced_score = entry.get("advanced_score")
             if advanced_score is not None:
                 advanced_support = entry.get("advanced_support")
@@ -484,6 +577,17 @@ def render_pick_cards(entries: List[Dict[str, Any]], *, show_score: bool = False
                 if trigger_labels:
                     st.caption("Trigger hits: " + "; ".join(trigger_labels[:4]))
 
+            num_bets = entry.get("num_bets")
+            if num_bets is not None:
+                liquidity_note = (
+                    "major-market game"
+                    if entry.get("major_market_game") is True
+                    else "non-major market"
+                )
+                st.caption(f"Market liquidity: {num_bets} bets ({liquidity_note})")
+            if entry.get("key_number_risk") is True:
+                st.caption("Key-number caution: spread is near ±3/±4/±7/±10.")
+
             if show_score:
                 params = entry.get("parameters_triggered") or []
                 if params:
@@ -493,7 +597,7 @@ def render_pick_cards(entries: List[Dict[str, Any]], *, show_score: bool = False
                     st.caption(f"Average public % across triggers: {avg_public}")
                 if entry.get("combined_score") is not None:
                     st.caption(
-                        "Combined score (params + season + advanced): "
+                        "Combined score (params + model edge + probability + portfolio): "
                         f"{entry.get('combined_score')}"
                     )
 
@@ -505,13 +609,38 @@ def render_pick_cards(entries: List[Dict[str, Any]], *, show_score: bool = False
 def main() -> None:
     st.set_page_config(page_title="CBB Betting Picks", page_icon="🏀", layout="wide")
     st.title("🏀 CBB Betting Picks")
-    st.caption("Simplified board: parameters, picks, and top recommended bets.")
+    st.caption("Hybrid board: true-line edge, market confirmation, and disciplined final bets.")
 
     with st.sidebar:
         st.header("Settings")
         league = st.text_input("League", value="ncaab")
-        public_threshold = st.slider("Public threshold (%)", 50.0, 95.0, 70.0, 1.0)
+        public_threshold = st.slider("Public skew threshold (%)", 60.0, 95.0, 78.0, 1.0)
         public_metric = st.selectbox("Public metric", ["money", "tickets"], index=0)
+        true_line_min_edge_points = st.slider(
+            "True-line min edge (pts)",
+            1.0,
+            5.0,
+            2.0,
+            0.25,
+        )
+        min_probability_edge = st.slider(
+            "Min probability edge (%)",
+            1.0,
+            10.0,
+            3.0,
+            0.5,
+        )
+        min_liquidity_bets = st.slider(
+            "Min liquidity (num bets)",
+            100,
+            2500,
+            500,
+            50,
+        )
+        underdogs_only = st.toggle(
+            "Underdogs only (market-only strict mode)",
+            value=False,
+        )
         day_scope = st.selectbox("Game scope", ["Today + Tomorrow", "Today", "Tomorrow"], index=0)
         selected_books = st.multiselect(
             "Sportsbooks",
@@ -524,7 +653,7 @@ def main() -> None:
         )
 
         with st.expander("Performance", expanded=False):
-            fast_mode = st.toggle("Fast mode", value=True)
+            fast_mode = st.toggle("Fast mode", value=False)
             advanced_triggers = st.toggle(
                 "Advanced form triggers",
                 value=False,
@@ -539,7 +668,7 @@ def main() -> None:
             timezone_name = st.text_input("Timezone", value="America/New_York")
             if advanced_triggers and fast_mode:
                 st.caption(
-                    "Fast mode is auto-overridden when advanced triggers are enabled."
+                    "Advanced triggers force full-detail mode for this refresh."
                 )
 
         st.subheader("Refresh")
@@ -578,6 +707,10 @@ def main() -> None:
         "league": league.strip() or "ncaab",
         "public_threshold": float(public_threshold),
         "public_metric": public_metric,
+        "true_line_min_edge_points": float(true_line_min_edge_points),
+        "min_probability_edge": float(min_probability_edge) / 100.0,
+        "min_liquidity_bets": float(min_liquidity_bets),
+        "underdogs_only": bool(underdogs_only),
         "timezone": timezone_name.strip() or "America/New_York",
         "day_start_offset": 0 if day_scope != "Tomorrow" else 1,
         "days_ahead": 1 if day_scope == "Today + Tomorrow" else 0,
@@ -590,8 +723,8 @@ def main() -> None:
     }
     config_json = json.dumps(config, sort_keys=True)
 
-    st.info("Loading live picks... If slow, keep Fast mode on.")
-    with st.spinner("Fetching games and generating parameter picks..."):
+    st.info("Loading live picks from the hybrid model...")
+    with st.spinner("Fetching games and generating layered picks..."):
         try:
             report = load_report_cached(config_json, refresh_key)
         except Exception as exc:
@@ -671,11 +804,16 @@ def main() -> None:
     m4.metric("Parameter 3 picks", p3_count)
 
     st.caption(
-        "Generated: {generated} | Metric: {metric} | Threshold: {threshold}% | "
+        "Generated: {generated} | Metric: {metric} | Public skew ≥ {threshold}% | "
+        "True-line edge ≥ {true_edge} pts | Prob edge ≥ {prob_edge}% | "
         "Books: {books} | Advanced triggers: {advanced} | Scope: {scope} ({window})".format(
             generated=metadata.get("generated_at_utc", "unknown"),
             metric=metadata.get("public_metric", "unknown"),
             threshold=metadata.get("public_threshold_pct", "unknown"),
+            true_edge=metadata.get("true_line_min_edge_points", "unknown"),
+            prob_edge=round(float(metadata.get("min_probability_edge", 0.0)) * 100, 2)
+            if isinstance(metadata.get("min_probability_edge"), (int, float))
+            else "unknown",
             books=", ".join(str(x) for x in metadata.get("preferred_book_ids", [])),
             advanced=(
                 "on" if metadata.get("include_advanced_triggers", False) else "off"
@@ -716,12 +854,12 @@ def main() -> None:
         render_pick_cards(filtered_top, show_score=True)
 
     with tabs[1]:
-        st.subheader("Parameter 1 Picks")
+        st.subheader("Parameter 1: Core Team-Strength (True Line)")
         section = [e for e in filtered_entries if e.get("parameter") == "Parameter 1"]
         render_pick_cards(section)
 
     with tabs[2]:
-        st.subheader("Parameter 2 Picks")
+        st.subheader("Parameter 2: Market Confirmation")
         spread = [e for e in filtered_entries if e.get("parameter") == "Parameter 2 - Spread"]
         totals = [e for e in filtered_entries if e.get("parameter") == "Parameter 2 - Total"]
         st.markdown("#### Spread")
@@ -730,7 +868,7 @@ def main() -> None:
         render_pick_cards(totals)
 
     with tabs[3]:
-        st.subheader("Parameter 3 Picks")
+        st.subheader("Parameter 3: Portfolio-Quality Final Bets")
         section = [e for e in filtered_entries if e.get("parameter") == "Parameter 3"]
         render_pick_cards(section)
 
