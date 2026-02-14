@@ -26,22 +26,34 @@ The script is configured for reputable sportsbook feeds by default:
 
 ## Parameters implemented
 
-1. **Parameter 1 (Spread Contrarian)**
-   - If public is at or above the threshold on one spread side, and the spread is **not** moving toward the favorite, fade the public side.
+1. **Parameter 1 (Core Team Strength / True Line)**
+   - Builds a base spread projection from efficiency and form proxies:
+     - adjusted scoring margin proxy (`points_for - points_against`) with SOS adjustment
+     - tempo proxy (`points_for + points_against`)
+     - home-court advantage
+     - recent form weighting (last 5 weighted over last 10)
+     - injury/rotation impact
+   - Keeps games where model-vs-market spread edge is at least a threshold (default `2.0` points).
 
-2. **Parameter 2 (Line-Movement Conflict)**
-   - **Spread:** if line movement is against the public-heavy side, fade the public side.
-   - **Totals:** if public is heavy on over/under and the total moves opposite that side, fade the public side.
+2. **Parameter 2 (Market Confirmation / Value Layer)**
+   - Confirms Parameter 1 edges using market behavior:
+     - public skew threshold (default `78%`)
+     - reverse line movement against public side (`>= 1.5` points by default)
+     - late steam timing (default within `6` hours of tip)
+     - cross-book confirmation (`>= 2` books)
 
-3. **Parameter 3 (Safer Alternate-Style Pick)**
-   - Triggered on spread conflict scenarios (same trigger as Parameter 2 spread).
-   - Attempts to find a safer pick around a target odds window (default `-200` to `-250`):
-     - first tries explicit alternate spread markets from feed;
-     - if unavailable, uses a safer moneyline proxy from sportsbook odds.
+3. **Parameter 3 (Portfolio Quality / Discipline Layer)**
+   - Final bet set after risk filters:
+     - liquidity floor (`num_bets` threshold)
+     - avoid big favorites (>10 points) unless edge is very large
+     - key-number sensitivity around `3/4/7/10`
+     - minimum probability edge vs implied odds (default `>= 3%`)
+     - optional underdogs-only mode
+   - Totals are off by default for spread-focused discipline.
 
-## Model layer added
+## Model layer
 
-The script now creates a `model_projections` section per game using:
+The script can include a `model_projections` section per game using:
 
 - Team power rating (win rate, point differential, recent/conference form)
 - Efficiency proxies (points for / points against)
@@ -54,6 +66,7 @@ Model output includes:
 - projected total
 - win probabilities
 - market edge estimates vs current sportsbook line
+- true-line input breakdown (tempo, recent form, SOS proxy, injury gap)
 
 Each parameter pick now includes `model_alignment` so you can see whether model edge supports the pick.
 
@@ -103,13 +116,13 @@ Common options:
 
 ```bash
 python3 cbb_betting_algorithm.py \
-  --public-threshold 70 \
+  --public-threshold 78 \
   --public-metric money \
+  --true-line-min-edge-points 2.0 \
+  --min-probability-edge 0.03 \
+  --min-liquidity-bets 500 \
   --book-ids 68,69,71,75,79 \
   --home-court-advantage 2.7 \
-  --alt-target-low -250 \
-  --alt-target-high -200 \
-  --alt-target-mid -225 \
   --output reports/my_cbb_report.json
 ```
 
@@ -136,10 +149,10 @@ The script writes a JSON report containing:
 
 - `all_games_snapshot`: full game + sportsbook line snapshot
 - `model_projections`: model-based spread/total/win probability projections
-- `parameter_1`: picks from parameter 1
-- `parameter_2.spread`: spread picks from parameter 2
-- `parameter_2.totals`: totals picks from parameter 2
-- `parameter_3`: safer alternate-style recommendations
+- `parameter_1`: core team-strength true-line edges
+- `parameter_2.spread`: market-confirmed spread edges
+- `parameter_2.totals`: reserved (totals off by default in hybrid mode)
+- `parameter_3`: final discipline-filtered spread bets
 
 It also includes:
 - line release timestamps (`opener`)
@@ -151,5 +164,5 @@ It also includes:
 ## Notes
 
 - Lines and splits can change quickly.
-- If a market feed does not provide explicit alternate spreads, parameter 3 will fall back to a moneyline proxy and mark that in the report.
+- Alternate-line automation exists but is disabled by default in the hybrid setup.
 - `--watch` mode is the easiest way to keep the report fresh throughout the day.
