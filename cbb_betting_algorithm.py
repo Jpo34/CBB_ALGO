@@ -572,7 +572,7 @@ def filter_games_by_day_window(
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     tz = safe_timezone(timezone_name)
     today_local = dt.datetime.now(tz).date()
-    start_date = today_local + dt.timedelta(days=max(0, day_start_offset))
+    start_date = today_local + dt.timedelta(days=day_start_offset)
     end_date = start_date + dt.timedelta(days=max(0, days_ahead))
 
     filtered: List[Dict[str, Any]] = []
@@ -2491,7 +2491,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
         "--day-start-offset",
         type=int,
         default=0,
-        help="Start day offset from local today (default: 0).",
+        help="Start day offset from local today (can be negative, default: 0).",
     )
     parser.add_argument(
         "--days-ahead",

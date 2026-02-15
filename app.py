@@ -745,8 +745,42 @@ def main() -> None:
         else:
             st.session_state["last_successful_report"] = report
 
+    metadata = report.get("metadata", {})
     game_count = len(report.get("all_games_snapshot", []))
-    if game_count == 0:
+    board_games_count = int(metadata.get("board_games_count") or 0)
+    window_games_count = int(metadata.get("window_games_count") or 0)
+    scope_window_empty = bool(
+        game_count == 0 and board_games_count > 0 and window_games_count == 0
+    )
+    if scope_window_empty:
+        if day_scope == "Today + Tomorrow":
+            closest_scope_config = dict(config)
+            closest_scope_config["day_start_offset"] = -1
+            closest_scope_config["days_ahead"] = 2
+            with st.spinner("No games in current day window. Loading closest available slate..."):
+                try:
+                    closest_scope_report = run_report_uncached(closest_scope_config)
+                except Exception:
+                    closest_scope_report = {}
+            closest_scope_games = len(closest_scope_report.get("all_games_snapshot", []))
+            if closest_scope_games > 0:
+                st.info(
+                    "No games were returned in the current local day window. "
+                    "Showing the closest available board slate."
+                )
+                report = closest_scope_report
+                game_count = closest_scope_games
+                metadata = report.get("metadata", {})
+            else:
+                st.info(
+                    "Live board has games, but none currently match the selected local day window."
+                )
+        else:
+            st.info(
+                "Live board has games, but none currently match the selected day scope."
+            )
+
+    if game_count == 0 and not scope_window_empty:
         last_non_empty = st.session_state.get("last_non_empty_report")
         if isinstance(last_non_empty, dict) and len(last_non_empty.get("all_games_snapshot", [])) > 0:
             st.warning("Live source returned 0 games. Showing last non-empty snapshot.")
@@ -783,7 +817,7 @@ def main() -> None:
                     st.warning(
                         "Live source returned 0 games. This can happen temporarily while odds providers update."
                     )
-    else:
+    if game_count > 0:
         st.session_state["last_non_empty_report"] = report
         save_local_cached_report(report)
 
