@@ -47,6 +47,7 @@ DEFAULT_REQUEST_TIMEOUT_SECONDS = 20
 DEFAULT_REQUEST_RETRIES = 3
 DEFAULT_TIMEZONE = "America/New_York"
 DEFAULT_DAYS_AHEAD = 1
+DEFAULT_DAY_ROLLOVER_HOUR = 5
 KEY_SPREAD_NUMBERS = (3.0, 4.0, 7.0, 10.0)
 MAJOR_MARKET_CONFERENCES = {
     "ACC",
@@ -569,9 +570,16 @@ def filter_games_by_day_window(
     timezone_name: str,
     day_start_offset: int,
     days_ahead: int,
+    day_rollover_hour: int = DEFAULT_DAY_ROLLOVER_HOUR,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     tz = safe_timezone(timezone_name)
-    today_local = dt.datetime.now(tz).date()
+    now_local = dt.datetime.now(tz)
+    rollover_hour = max(0, min(23, int(day_rollover_hour)))
+    anchor_date = now_local.date()
+    if now_local.hour < rollover_hour:
+        anchor_date = anchor_date - dt.timedelta(days=1)
+
+    today_local = anchor_date
     start_date = today_local + dt.timedelta(days=day_start_offset)
     end_date = start_date + dt.timedelta(days=max(0, days_ahead))
 
@@ -604,6 +612,8 @@ def filter_games_by_day_window(
     window_meta = {
         "timezone": timezone_name,
         "today_local_date": today_local.isoformat(),
+        "now_local": now_local.isoformat(),
+        "day_rollover_hour": rollover_hour,
         "window_start_local_date": start_date.isoformat(),
         "window_end_local_date": end_date.isoformat(),
     }
@@ -1866,6 +1876,7 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
         timezone_name=args.timezone,
         day_start_offset=args.day_start_offset,
         days_ahead=args.days_ahead,
+        day_rollover_hour=getattr(args, "day_rollover_hour", DEFAULT_DAY_ROLLOVER_HOUR),
     )
     preferred_book_ids = [int(x) for x in args.book_ids.split(",") if x.strip()]
     include_model = bool(args.include_model)
@@ -2394,6 +2405,7 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
             "day_window": day_window_meta,
             "day_start_offset": args.day_start_offset,
             "days_ahead": args.days_ahead,
+            "day_rollover_hour": getattr(args, "day_rollover_hour", DEFAULT_DAY_ROLLOVER_HOUR),
             "board_games_count": len(board_games),
             "window_games_count": len(games),
             "preferred_book_ids": preferred_book_ids,
@@ -2500,6 +2512,15 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
         help=(
             f"Days ahead from start offset to include (default: {DEFAULT_DAYS_AHEAD}). "
             "0 means one local day only."
+        ),
+    )
+    parser.add_argument(
+        "--day-rollover-hour",
+        type=int,
+        default=DEFAULT_DAY_ROLLOVER_HOUR,
+        help=(
+            "Local hour when a new betting day starts (0-23, default: 5). "
+            "Before this hour, games still map to previous betting day."
         ),
     )
     parser.add_argument(

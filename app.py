@@ -53,6 +53,7 @@ def build_engine_args(config: Dict[str, Any]) -> argparse.Namespace:
         timezone=config["timezone"],
         day_start_offset=config["day_start_offset"],
         days_ahead=config["days_ahead"],
+        day_rollover_hour=config.get("day_rollover_hour", 5),
         book_ids=config["book_ids"],
         max_workers=config["max_workers"],
         include_model=False,
@@ -666,6 +667,17 @@ def main() -> None:
             request_timeout = st.slider("Request timeout (sec)", 5, 40, 12, 1)
             request_retries = st.slider("Request retries", 1, 5, 2, 1)
             timezone_name = st.text_input("Timezone", value="America/New_York")
+            day_rollover_hour = st.slider(
+                "Betting day rollover hour (local)",
+                0,
+                12,
+                5,
+                1,
+                help=(
+                    "Before this hour, the app treats games as part of the previous betting day "
+                    "(helps overnight boards keep showing active slates)."
+                ),
+            )
             if advanced_triggers and fast_mode:
                 st.caption(
                     "Advanced triggers force full-detail mode for this refresh."
@@ -712,6 +724,7 @@ def main() -> None:
         "min_liquidity_bets": float(min_liquidity_bets),
         "underdogs_only": bool(underdogs_only),
         "timezone": timezone_name.strip() or "America/New_York",
+        "day_rollover_hour": int(day_rollover_hour),
         "day_start_offset": 0 if day_scope != "Tomorrow" else 1,
         "days_ahead": 1 if day_scope == "Today + Tomorrow" else 0,
         "book_ids": ",".join(str(book_id) for book_id in selected_books),
@@ -859,6 +872,10 @@ def main() -> None:
             ),
         )
     )
+    if isinstance(metadata.get("day_rollover_hour"), (int, float)):
+        st.caption(
+            f"Betting-day rollover hour: {int(metadata.get('day_rollover_hour'))}:00 local"
+        )
 
     st.divider()
     filter_col1, filter_col2 = st.columns([2, 1])
