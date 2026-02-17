@@ -60,9 +60,11 @@ def build_engine_args(config: Dict[str, Any]) -> argparse.Namespace:
         include_advanced_triggers=config["include_advanced_triggers"],
         include_totals=False,
         enable_alt_automation=False,
-        rlm_min_points=1.5,
+        rlm_min_points=1.0,
         rlm_strong_points=2.0,
         rlm_late_hours=6.0,
+        rlm_pre_window_hours=24.0,
+        allow_pre_late_confirmation=True,
         rlm_min_book_confirmations=2,
         true_line_min_edge_points=float(config.get("true_line_min_edge_points", 2.0)),
         cover_probability_scale=5.0,
@@ -169,6 +171,8 @@ def normalize_parameter_entries(report: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "rlm_points": record.get("rlm_points"),
                 "rlm_book_confirmation_count": record.get("rlm_book_confirmation_count"),
                 "rlm_timing_ok": record.get("rlm_timing_ok"),
+                "late_steam_confirmed": record.get("late_steam_confirmed"),
+                "rlm_timing_status": record.get("rlm_timing_status"),
                 "core_rlm_qualified": record.get("core_rlm_qualified"),
                 "true_line_gap_points": record.get("true_line_gap_points"),
                 "probability_edge": record.get("probability_edge"),
@@ -215,6 +219,8 @@ def normalize_parameter_entries(report: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "rlm_points": record.get("rlm_points"),
                 "rlm_book_confirmation_count": record.get("rlm_book_confirmation_count"),
                 "rlm_timing_ok": record.get("rlm_timing_ok"),
+                "late_steam_confirmed": record.get("late_steam_confirmed"),
+                "rlm_timing_status": record.get("rlm_timing_status"),
                 "core_rlm_qualified": record.get("core_rlm_qualified"),
                 "true_line_gap_points": record.get("true_line_gap_points"),
                 "probability_edge": record.get("probability_edge"),
@@ -588,6 +594,9 @@ def render_pick_cards(entries: List[Dict[str, Any]], *, show_score: bool = False
                 st.caption(f"Market liquidity: {num_bets} bets ({liquidity_note})")
             if entry.get("key_number_risk") is True:
                 st.caption("Key-number caution: spread is near ±3/±4/±7/±10.")
+            timing_status = str(entry.get("rlm_timing_status") or "").strip()
+            if timing_status == "pre_window_pending":
+                st.caption("Market timing: provisional (inside pre-tip window, late steam not confirmed yet).")
 
             if show_score:
                 params = entry.get("parameters_triggered") or []

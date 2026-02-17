@@ -38,9 +38,10 @@ The script is configured for reputable sportsbook feeds by default:
 2. **Parameter 2 (Market Confirmation / Value Layer)**
    - Confirms Parameter 1 edges using market behavior:
      - public skew threshold (default `78%`)
-     - reverse line movement against public side (`>= 1.5` points by default)
+     - reverse line movement against public side (`>= 1.0` points by default)
      - late steam timing (default within `6` hours of tip)
      - cross-book confirmation (`>= 2` books)
+   - By default, the engine can also surface **provisional** confirmations inside a broader pre-tip window (24h) when all non-timing gates pass; these are marked as pending late steam confirmation.
 
 3. **Parameter 3 (Portfolio Quality / Discipline Layer)**
    - Final bet set after risk filters:
