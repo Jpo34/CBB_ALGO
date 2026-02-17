@@ -47,6 +47,7 @@ DEFAULT_REQUEST_TIMEOUT_SECONDS = 20
 DEFAULT_REQUEST_RETRIES = 3
 DEFAULT_TIMEZONE = "America/New_York"
 DEFAULT_DAYS_AHEAD = 1
+DEFAULT_DAY_ROLLOVER_HOUR = 5
 KEY_SPREAD_NUMBERS = (3.0, 4.0, 7.0, 10.0)
 MAJOR_MARKET_CONFERENCES = {
     "ACC",
@@ -569,10 +570,17 @@ def filter_games_by_day_window(
     timezone_name: str,
     day_start_offset: int,
     days_ahead: int,
+    day_rollover_hour: int = DEFAULT_DAY_ROLLOVER_HOUR,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     tz = safe_timezone(timezone_name)
-    today_local = dt.datetime.now(tz).date()
-    start_date = today_local + dt.timedelta(days=max(0, day_start_offset))
+    now_local = dt.datetime.now(tz)
+    rollover_hour = max(0, min(23, int(day_rollover_hour)))
+    anchor_date = now_local.date()
+    if now_local.hour < rollover_hour:
+        anchor_date = anchor_date - dt.timedelta(days=1)
+
+    today_local = anchor_date
+    start_date = today_local + dt.timedelta(days=day_start_offset)
     end_date = start_date + dt.timedelta(days=max(0, days_ahead))
 
     filtered: List[Dict[str, Any]] = []
@@ -604,6 +612,8 @@ def filter_games_by_day_window(
     window_meta = {
         "timezone": timezone_name,
         "today_local_date": today_local.isoformat(),
+        "now_local": now_local.isoformat(),
+        "day_rollover_hour": rollover_hour,
         "window_start_local_date": start_date.isoformat(),
         "window_end_local_date": end_date.isoformat(),
     }
@@ -1008,6 +1018,62 @@ def spread_rlm_points_against_public(spread_summary: Dict[str, Any]) -> float:
     )
 
 
+def spread_book_rlm_metrics(
+    *,
+    history_data: Dict[str, Any],
+    public_side: str,
+) -> Dict[int, Dict[str, Any]]:
+    metrics: Dict[int, Dict[str, Any]] = {}
+    for book_id, book_data in history_data.items():
+        event = book_data.get("event", {})
+        spread = event.get("spread") or []
+        side_map = by_side(spread)
+        public_outcome = side_map.get(public_side)
+        if not public_outcome:
+            continue
+
+        history = sort_history(public_outcome.get("history") or [])
+        if not history:
+            continue
+        opener = history[0]
+        current = history[-1]
+        try:
+            open_value = float(opener["value"])
+            current_value = float(current["value"])
+        except (KeyError, TypeError, ValueError):
+            continue
+
+        net_points = spread_points_against_side(
+            open_value=open_value,
+            current_value=current_value,
+        )
+
+        peak_entry = history[0]
+        if open_value < 0:
+            peak_entry = max(history, key=lambda x: safe_float(x.get("value"), open_value))
+        else:
+            peak_entry = min(history, key=lambda x: safe_float(x.get("value"), open_value))
+        peak_value = safe_float(peak_entry.get("value"), open_value)
+        peak_points = spread_points_against_side(
+            open_value=open_value,
+            current_value=peak_value,
+        )
+
+        try:
+            parsed_book_id = int(book_id)
+        except (TypeError, ValueError):
+            continue
+        metrics[parsed_book_id] = {
+            "net_points": round(net_points, 3),
+            "peak_points": round(peak_points, 3),
+            "open_value": round(open_value, 3),
+            "current_value": round(current_value, 3),
+            "peak_value": round(peak_value, 3),
+            "peak_timestamp_utc": peak_entry.get("updated_at"),
+        }
+    return metrics
+
+
 def total_rlm_points_against_public(total_summary: Dict[str, Any]) -> float:
     public_side = total_summary.get("heavy_public_side")
     if public_side == "over":
@@ -1028,27 +1094,28 @@ def count_spread_book_confirmations(
     history_data: Dict[str, Any],
     public_side: str,
     min_points: float,
+    mode: str = "net",
 ) -> Tuple[int, List[int]]:
+    if mode not in ("net", "peak", "effective"):
+        mode = "net"
+
+    metrics = spread_book_rlm_metrics(
+        history_data=history_data,
+        public_side=public_side,
+    )
     confirmations: List[int] = []
-    for book_id, book_data in history_data.items():
-        event = book_data.get("event", {})
-        spread = event.get("spread") or []
-        side_map = by_side(spread)
-        public_outcome = side_map.get(public_side)
-        if not public_outcome:
-            continue
-        opening, current = get_open_current(public_outcome)
-        if not opening or not current:
-            continue
-        points = spread_points_against_side(
-            open_value=float(opening["value"]),
-            current_value=float(current["value"]),
-        )
+    for book_id, metric in metrics.items():
+        if mode == "peak":
+            points = safe_float(metric.get("peak_points"), 0.0)
+        elif mode == "effective":
+            points = max(
+                safe_float(metric.get("net_points"), 0.0),
+                safe_float(metric.get("peak_points"), 0.0),
+            )
+        else:
+            points = safe_float(metric.get("net_points"), 0.0)
         if points >= min_points:
-            try:
-                confirmations.append(int(book_id))
-            except (TypeError, ValueError):
-                continue
+            confirmations.append(int(book_id))
     return len(confirmations), confirmations
 
 
@@ -1866,6 +1933,7 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
         timezone_name=args.timezone,
         day_start_offset=args.day_start_offset,
         days_ahead=args.days_ahead,
+        day_rollover_hour=getattr(args, "day_rollover_hour", DEFAULT_DAY_ROLLOVER_HOUR),
     )
     preferred_book_ids = [int(x) for x in args.book_ids.split(",") if x.strip()]
     include_model = bool(args.include_model)
@@ -1891,7 +1959,11 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
             ] = ("history", game_id)
 
             game_url = game_links.get(game_id)
-            if game_url and not args.skip_detail_context:
+            if (
+                game_url
+                and not args.skip_detail_context
+                and (include_model or include_advanced_triggers)
+            ):
                 future_map[
                     executor.submit(
                         fetch_game_detail_context,
@@ -1982,10 +2054,11 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
             else None
         )
         detail_context = detail_contexts.get(game_id) or {}
+        signal_detail_context = detail_context if include_model else {}
         model_projection = build_model_projection(
             game=game,
             teams=teams,
-            detail_context=detail_context,
+            detail_context=signal_detail_context,
             home_court_advantage=args.home_court_advantage,
         )
         model_edges = model_market_edges(
@@ -2105,28 +2178,92 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
         public_opposes_model = (
             heavy_public_side in ("home", "away") and heavy_public_side != model_side
         )
-        rlm_points = (
+        analysis_rlm_points = (
             spread_rlm_points_against_public(spread_summary)
             if heavy_public_side in ("home", "away")
             else 0.0
         )
-        rlm_is_strong = rlm_points >= args.rlm_strong_points
-        rlm_min_ok = rlm_points >= args.rlm_min_points
+        book_rlm_metrics = (
+            spread_book_rlm_metrics(
+                history_data=history_data,
+                public_side=heavy_public_side,
+            )
+            if heavy_public_side in ("home", "away")
+            else {}
+        )
         book_confirm_count, book_confirmations = (
             count_spread_book_confirmations(
                 history_data=history_data,
                 public_side=heavy_public_side,
                 min_points=args.rlm_min_points,
+                mode="effective",
             )
             if heavy_public_side in ("home", "away")
             else (0, [])
         )
         book_confirmation_ok = book_confirm_count >= args.rlm_min_book_confirmations
-        tipoff_hours = hours_to_tipoff(
+        confirmed_rlm_points = max(
+            [
+                max(
+                    safe_float((book_rlm_metrics.get(book_id) or {}).get("net_points"), 0.0),
+                    safe_float((book_rlm_metrics.get(book_id) or {}).get("peak_points"), 0.0),
+                )
+                for book_id in book_confirmations
+            ],
+            default=0.0,
+        )
+        rlm_points = max(analysis_rlm_points, confirmed_rlm_points)
+        rlm_peak_points = max(
+            [safe_float(metric.get("peak_points"), 0.0) for metric in book_rlm_metrics.values()],
+            default=analysis_rlm_points,
+        )
+        rlm_is_strong = rlm_points >= args.rlm_strong_points
+        rlm_min_ok = rlm_points >= args.rlm_min_points
+
+        tipoff_hours_analysis = hours_to_tipoff(
             game.get("start_time"),
             spread_summary.get("last_update_utc"),
         )
-        timing_ok = tipoff_hours is not None and tipoff_hours <= args.rlm_late_hours
+        peak_tipoff_hour_candidates: List[float] = []
+        for book_id in book_confirmations:
+            peak_ts = (book_rlm_metrics.get(book_id) or {}).get("peak_timestamp_utc")
+            if not peak_ts:
+                continue
+            peak_tipoff_hours = hours_to_tipoff(game.get("start_time"), peak_ts)
+            if peak_tipoff_hours is not None:
+                peak_tipoff_hour_candidates.append(float(peak_tipoff_hours))
+        tipoff_hours_peak = (
+            min(peak_tipoff_hour_candidates)
+            if peak_tipoff_hour_candidates
+            else None
+        )
+
+        rlm_late_hours = safe_float(getattr(args, "rlm_late_hours", 6.0), 6.0)
+        rlm_pre_window_hours = safe_float(
+            getattr(args, "rlm_pre_window_hours", 24.0),
+            24.0,
+        )
+        allow_pre_late_confirmation = bool(
+            getattr(args, "allow_pre_late_confirmation", True)
+        )
+        tipoff_hours = (
+            tipoff_hours_peak if tipoff_hours_peak is not None else tipoff_hours_analysis
+        )
+        late_timing_ok = (
+            tipoff_hours is not None and tipoff_hours <= rlm_late_hours
+        )
+        pre_window_ok = (
+            tipoff_hours is not None and tipoff_hours <= rlm_pre_window_hours
+        )
+        timing_ok = late_timing_ok or (
+            allow_pre_late_confirmation and pre_window_ok
+        )
+        if late_timing_ok:
+            timing_status = "late_confirmed"
+        elif pre_window_ok:
+            timing_status = "pre_window_pending"
+        else:
+            timing_status = "outside_window"
 
         market_confirmed = bool(
             public_opposes_model
@@ -2179,6 +2316,9 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
                 "is_home_underdog_pick": is_home_underdog_pick,
                 "pick_is_favorite": pick_is_favorite,
                 "rlm_points": round(rlm_points, 3),
+                "rlm_analysis_points": round(analysis_rlm_points, 3),
+                "rlm_consensus_points": round(confirmed_rlm_points, 3),
+                "rlm_peak_points": round(rlm_peak_points, 3),
                 "rlm_min_required": args.rlm_min_points,
                 "rlm_strong_threshold": args.rlm_strong_points,
                 "rlm_is_strong": rlm_is_strong,
@@ -2189,13 +2329,24 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
                 "rlm_timing_hours_to_tip": round(tipoff_hours, 3)
                 if tipoff_hours is not None
                 else None,
-                "rlm_timing_late_hours_threshold": args.rlm_late_hours,
+                "rlm_timing_hours_to_tip_analysis": round(tipoff_hours_analysis, 3)
+                if tipoff_hours_analysis is not None
+                else None,
+                "rlm_timing_hours_to_tip_peak": round(tipoff_hours_peak, 3)
+                if tipoff_hours_peak is not None
+                else None,
+                "rlm_timing_late_hours_threshold": rlm_late_hours,
+                "rlm_pre_window_hours_threshold": rlm_pre_window_hours,
+                "rlm_allow_pre_late_confirmation": allow_pre_late_confirmation,
+                "late_steam_confirmed": late_timing_ok,
+                "rlm_pre_window_ok": pre_window_ok,
                 "rlm_timing_ok": timing_ok,
+                "rlm_timing_status": timing_status,
                 "core_rlm_qualified": market_confirmed,
                 "season_alignment": season_alignment_for_pick_side(model_side, season_context),
                 "reason": (
                     "Model edge confirmed by market behavior: public skew opposite pick, "
-                    "RLM against public, late steam, and multi-book consensus."
+                    "RLM against public, book consensus, and timing gate."
                 ),
             }
         )
@@ -2323,6 +2474,9 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
                 "key_number_buffer": args.key_number_buffer,
                 "key_number_extra_edge": args.key_number_extra_edge,
                 "rlm_points": round(rlm_points, 3),
+                "rlm_analysis_points": round(analysis_rlm_points, 3),
+                "rlm_consensus_points": round(confirmed_rlm_points, 3),
+                "rlm_peak_points": round(rlm_peak_points, 3),
                 "rlm_min_required": args.rlm_min_points,
                 "rlm_strong_threshold": args.rlm_strong_points,
                 "rlm_is_strong": rlm_is_strong,
@@ -2333,8 +2487,19 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
                 "rlm_timing_hours_to_tip": round(tipoff_hours, 3)
                 if tipoff_hours is not None
                 else None,
-                "rlm_timing_late_hours_threshold": args.rlm_late_hours,
+                "rlm_timing_hours_to_tip_analysis": round(tipoff_hours_analysis, 3)
+                if tipoff_hours_analysis is not None
+                else None,
+                "rlm_timing_hours_to_tip_peak": round(tipoff_hours_peak, 3)
+                if tipoff_hours_peak is not None
+                else None,
+                "rlm_timing_late_hours_threshold": rlm_late_hours,
+                "rlm_pre_window_hours_threshold": rlm_pre_window_hours,
+                "rlm_allow_pre_late_confirmation": allow_pre_late_confirmation,
+                "late_steam_confirmed": late_timing_ok,
+                "rlm_pre_window_ok": pre_window_ok,
                 "rlm_timing_ok": timing_ok,
+                "rlm_timing_status": timing_status,
                 "core_rlm_qualified": market_confirmed,
                 "season_alignment": season_alignment_for_pick_side(model_side, season_context),
                 "safer_alternate_pick": alt_pick,
@@ -2383,6 +2548,14 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
             "key_number_extra_edge": args.key_number_extra_edge,
             "underdogs_only": bool(args.underdogs_only),
             "flat_bet_units": args.flat_bet_units,
+            "rlm_min_points": args.rlm_min_points,
+            "rlm_strong_points": args.rlm_strong_points,
+            "rlm_late_hours": args.rlm_late_hours,
+            "rlm_pre_window_hours": getattr(args, "rlm_pre_window_hours", 24.0),
+            "allow_pre_late_confirmation": bool(
+                getattr(args, "allow_pre_late_confirmation", True)
+            ),
+            "rlm_min_book_confirmations": args.rlm_min_book_confirmations,
             "detail_context_enabled": not args.skip_detail_context,
             "request_timeout_seconds": args.request_timeout,
             "request_retries": args.request_retries,
@@ -2394,6 +2567,7 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
             "day_window": day_window_meta,
             "day_start_offset": args.day_start_offset,
             "days_ahead": args.days_ahead,
+            "day_rollover_hour": getattr(args, "day_rollover_hour", DEFAULT_DAY_ROLLOVER_HOUR),
             "board_games_count": len(board_games),
             "window_games_count": len(games),
             "preferred_book_ids": preferred_book_ids,
@@ -2415,6 +2589,11 @@ def run_analysis(args: argparse.Namespace) -> Dict[str, Any]:
                 ),
                 (
                     "Parameter 2 = market confirmation only (public skew, reverse move magnitude, timing, book consensus)."
+                ),
+                (
+                    "When enabled, pre-late confirmation surfaces provisional picks inside pre-tip window before late steam lock."
+                    if bool(getattr(args, "allow_pre_late_confirmation", True))
+                    else "Only strict late-steam timing confirmations are included."
                 ),
                 (
                     "Parameter 3 = final portfolio filters (liquidity, big-favorite guardrails, key-number caution, probability edge)."
@@ -2491,7 +2670,7 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
         "--day-start-offset",
         type=int,
         default=0,
-        help="Start day offset from local today (default: 0).",
+        help="Start day offset from local today (can be negative, default: 0).",
     )
     parser.add_argument(
         "--days-ahead",
@@ -2500,6 +2679,15 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
         help=(
             f"Days ahead from start offset to include (default: {DEFAULT_DAYS_AHEAD}). "
             "0 means one local day only."
+        ),
+    )
+    parser.add_argument(
+        "--day-rollover-hour",
+        type=int,
+        default=DEFAULT_DAY_ROLLOVER_HOUR,
+        help=(
+            "Local hour when a new betting day starts (0-23, default: 5). "
+            "Before this hour, games still map to previous betting day."
         ),
     )
     parser.add_argument(
@@ -2543,8 +2731,8 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
     parser.add_argument(
         "--rlm-min-points",
         type=float,
-        default=1.5,
-        help="Minimum points of reverse line movement required (default: 1.5).",
+        default=1.0,
+        help="Minimum points of reverse line movement required (default: 1.0).",
     )
     parser.add_argument(
         "--rlm-strong-points",
@@ -2557,6 +2745,24 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
         type=float,
         default=6.0,
         help="Timing filter: RLM must occur within this many hours to tip-off (default: 6).",
+    )
+    parser.add_argument(
+        "--rlm-pre-window-hours",
+        type=float,
+        default=24.0,
+        help=(
+            "Pre-tip window for provisional market confirmations. "
+            "If late window is not yet reached, picks can still be surfaced inside this range."
+        ),
+    )
+    parser.add_argument(
+        "--allow-pre-late-confirmation",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Allow provisional Parameter 2/3 picks before late steam window if other "
+            "market confirmation gates pass (default: on)."
+        ),
     )
     parser.add_argument(
         "--rlm-min-book-confirmations",

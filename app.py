@@ -53,15 +53,18 @@ def build_engine_args(config: Dict[str, Any]) -> argparse.Namespace:
         timezone=config["timezone"],
         day_start_offset=config["day_start_offset"],
         days_ahead=config["days_ahead"],
+        day_rollover_hour=config.get("day_rollover_hour", 5),
         book_ids=config["book_ids"],
         max_workers=config["max_workers"],
         include_model=False,
         include_advanced_triggers=config["include_advanced_triggers"],
         include_totals=False,
         enable_alt_automation=False,
-        rlm_min_points=1.5,
+        rlm_min_points=1.0,
         rlm_strong_points=2.0,
         rlm_late_hours=6.0,
+        rlm_pre_window_hours=24.0,
+        allow_pre_late_confirmation=True,
         rlm_min_book_confirmations=2,
         true_line_min_edge_points=float(config.get("true_line_min_edge_points", 2.0)),
         cover_probability_scale=5.0,
@@ -168,6 +171,8 @@ def normalize_parameter_entries(report: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "rlm_points": record.get("rlm_points"),
                 "rlm_book_confirmation_count": record.get("rlm_book_confirmation_count"),
                 "rlm_timing_ok": record.get("rlm_timing_ok"),
+                "late_steam_confirmed": record.get("late_steam_confirmed"),
+                "rlm_timing_status": record.get("rlm_timing_status"),
                 "core_rlm_qualified": record.get("core_rlm_qualified"),
                 "true_line_gap_points": record.get("true_line_gap_points"),
                 "probability_edge": record.get("probability_edge"),
@@ -214,6 +219,8 @@ def normalize_parameter_entries(report: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "rlm_points": record.get("rlm_points"),
                 "rlm_book_confirmation_count": record.get("rlm_book_confirmation_count"),
                 "rlm_timing_ok": record.get("rlm_timing_ok"),
+                "late_steam_confirmed": record.get("late_steam_confirmed"),
+                "rlm_timing_status": record.get("rlm_timing_status"),
                 "core_rlm_qualified": record.get("core_rlm_qualified"),
                 "true_line_gap_points": record.get("true_line_gap_points"),
                 "probability_edge": record.get("probability_edge"),
@@ -587,6 +594,9 @@ def render_pick_cards(entries: List[Dict[str, Any]], *, show_score: bool = False
                 st.caption(f"Market liquidity: {num_bets} bets ({liquidity_note})")
             if entry.get("key_number_risk") is True:
                 st.caption("Key-number caution: spread is near ±3/±4/±7/±10.")
+            timing_status = str(entry.get("rlm_timing_status") or "").strip()
+            if timing_status == "pre_window_pending":
+                st.caption("Market timing: provisional (inside pre-tip window, late steam not confirmed yet).")
 
             if show_score:
                 params = entry.get("parameters_triggered") or []
@@ -666,6 +676,17 @@ def main() -> None:
             request_timeout = st.slider("Request timeout (sec)", 5, 40, 12, 1)
             request_retries = st.slider("Request retries", 1, 5, 2, 1)
             timezone_name = st.text_input("Timezone", value="America/New_York")
+            day_rollover_hour = st.slider(
+                "Betting day rollover hour (local)",
+                0,
+                12,
+                5,
+                1,
+                help=(
+                    "Before this hour, the app treats games as part of the previous betting day "
+                    "(helps overnight boards keep showing active slates)."
+                ),
+            )
             if advanced_triggers and fast_mode:
                 st.caption(
                     "Advanced triggers force full-detail mode for this refresh."
@@ -712,6 +733,7 @@ def main() -> None:
         "min_liquidity_bets": float(min_liquidity_bets),
         "underdogs_only": bool(underdogs_only),
         "timezone": timezone_name.strip() or "America/New_York",
+        "day_rollover_hour": int(day_rollover_hour),
         "day_start_offset": 0 if day_scope != "Tomorrow" else 1,
         "days_ahead": 1 if day_scope == "Today + Tomorrow" else 0,
         "book_ids": ",".join(str(book_id) for book_id in selected_books),
@@ -745,8 +767,42 @@ def main() -> None:
         else:
             st.session_state["last_successful_report"] = report
 
+    metadata = report.get("metadata", {})
     game_count = len(report.get("all_games_snapshot", []))
-    if game_count == 0:
+    board_games_count = int(metadata.get("board_games_count") or 0)
+    window_games_count = int(metadata.get("window_games_count") or 0)
+    scope_window_empty = bool(
+        game_count == 0 and board_games_count > 0 and window_games_count == 0
+    )
+    if scope_window_empty:
+        if day_scope == "Today + Tomorrow":
+            closest_scope_config = dict(config)
+            closest_scope_config["day_start_offset"] = -1
+            closest_scope_config["days_ahead"] = 2
+            with st.spinner("No games in current day window. Loading closest available slate..."):
+                try:
+                    closest_scope_report = run_report_uncached(closest_scope_config)
+                except Exception:
+                    closest_scope_report = {}
+            closest_scope_games = len(closest_scope_report.get("all_games_snapshot", []))
+            if closest_scope_games > 0:
+                st.info(
+                    "No games were returned in the current local day window. "
+                    "Showing the closest available board slate."
+                )
+                report = closest_scope_report
+                game_count = closest_scope_games
+                metadata = report.get("metadata", {})
+            else:
+                st.info(
+                    "Live board has games, but none currently match the selected local day window."
+                )
+        else:
+            st.info(
+                "Live board has games, but none currently match the selected day scope."
+            )
+
+    if game_count == 0 and not scope_window_empty:
         last_non_empty = st.session_state.get("last_non_empty_report")
         if isinstance(last_non_empty, dict) and len(last_non_empty.get("all_games_snapshot", [])) > 0:
             st.warning("Live source returned 0 games. Showing last non-empty snapshot.")
@@ -783,7 +839,7 @@ def main() -> None:
                     st.warning(
                         "Live source returned 0 games. This can happen temporarily while odds providers update."
                     )
-    else:
+    if game_count > 0:
         st.session_state["last_non_empty_report"] = report
         save_local_cached_report(report)
 
@@ -825,6 +881,10 @@ def main() -> None:
             ),
         )
     )
+    if isinstance(metadata.get("day_rollover_hour"), (int, float)):
+        st.caption(
+            f"Betting-day rollover hour: {int(metadata.get('day_rollover_hour'))}:00 local"
+        )
 
     st.divider()
     filter_col1, filter_col2 = st.columns([2, 1])
