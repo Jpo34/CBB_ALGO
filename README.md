@@ -86,6 +86,9 @@ python3 -m streamlit run app.py
 ```
 
 Dashboard features:
+- sport mode selector with separate presets:
+  - **CBB Hybrid** (`ncaab`)
+  - **NBA Hybrid** (`nba`)
 - tabs for:
   - Top Recommended Bets (descending)
   - Parameter 1

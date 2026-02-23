@@ -27,6 +27,50 @@ DEFAULT_BOOK_OPTIONS = [
     (79, "bet365"),
 ]
 LOCAL_CACHE_PATH = ".streamlit_cache/last_non_empty_report.json"
+SPORT_MODE_PRESETS: Dict[str, Dict[str, Any]] = {
+    "CBB Hybrid": {
+        "league": "ncaab",
+        "public_threshold": 78.0,
+        "true_line_min_edge_points": 2.0,
+        "min_probability_edge": 0.03,
+        "min_liquidity_bets": 500.0,
+        "rlm_min_points": 1.0,
+        "rlm_strong_points": 2.0,
+        "rlm_late_hours": 6.0,
+        "rlm_pre_window_hours": 24.0,
+        "allow_pre_late_confirmation": True,
+        "rlm_min_book_confirmations": 2,
+        "avoid_big_favorite_points": 10.0,
+        "big_favorite_min_edge": 3.5,
+        "key_number_buffer": 0.35,
+        "key_number_extra_edge": 0.75,
+        "cover_probability_scale": 5.0,
+        "home_court_advantage": 2.7,
+        "flat_bet_units": 1.0,
+        "day_rollover_hour": 5,
+    },
+    "NBA Hybrid": {
+        "league": "nba",
+        "public_threshold": 74.0,
+        "true_line_min_edge_points": 1.75,
+        "min_probability_edge": 0.028,
+        "min_liquidity_bets": 1000.0,
+        "rlm_min_points": 0.75,
+        "rlm_strong_points": 1.5,
+        "rlm_late_hours": 4.0,
+        "rlm_pre_window_hours": 16.0,
+        "allow_pre_late_confirmation": True,
+        "rlm_min_book_confirmations": 2,
+        "avoid_big_favorite_points": 9.0,
+        "big_favorite_min_edge": 4.0,
+        "key_number_buffer": 0.25,
+        "key_number_extra_edge": 0.6,
+        "cover_probability_scale": 4.5,
+        "home_court_advantage": 2.2,
+        "flat_bet_units": 1.0,
+        "day_rollover_hour": 5,
+    },
+}
 
 
 def load_local_cached_report() -> Dict[str, Any] | None:
@@ -60,27 +104,31 @@ def build_engine_args(config: Dict[str, Any]) -> argparse.Namespace:
         include_advanced_triggers=config["include_advanced_triggers"],
         include_totals=False,
         enable_alt_automation=False,
-        rlm_min_points=1.0,
-        rlm_strong_points=2.0,
-        rlm_late_hours=6.0,
-        rlm_pre_window_hours=24.0,
-        allow_pre_late_confirmation=True,
-        rlm_min_book_confirmations=2,
+        rlm_min_points=float(config.get("rlm_min_points", 1.0)),
+        rlm_strong_points=float(config.get("rlm_strong_points", 2.0)),
+        rlm_late_hours=float(config.get("rlm_late_hours", 6.0)),
+        rlm_pre_window_hours=float(config.get("rlm_pre_window_hours", 24.0)),
+        allow_pre_late_confirmation=bool(
+            config.get("allow_pre_late_confirmation", True)
+        ),
+        rlm_min_book_confirmations=int(
+            config.get("rlm_min_book_confirmations", 2)
+        ),
         true_line_min_edge_points=float(config.get("true_line_min_edge_points", 2.0)),
-        cover_probability_scale=5.0,
+        cover_probability_scale=float(config.get("cover_probability_scale", 5.0)),
         min_probability_edge=float(config.get("min_probability_edge", 0.03)),
         min_liquidity_bets=float(config.get("min_liquidity_bets", 500.0)),
-        avoid_big_favorite_points=10.0,
-        big_favorite_min_edge=3.5,
-        key_number_buffer=0.35,
-        key_number_extra_edge=0.75,
+        avoid_big_favorite_points=float(config.get("avoid_big_favorite_points", 10.0)),
+        big_favorite_min_edge=float(config.get("big_favorite_min_edge", 3.5)),
+        key_number_buffer=float(config.get("key_number_buffer", 0.35)),
+        key_number_extra_edge=float(config.get("key_number_extra_edge", 0.75)),
         underdogs_only=bool(config.get("underdogs_only", False)),
-        flat_bet_units=1.0,
+        flat_bet_units=float(config.get("flat_bet_units", 1.0)),
         compact_output=True,
         skip_detail_context=config["skip_detail_context"],
         request_timeout=config["request_timeout"],
         request_retries=config["request_retries"],
-        home_court_advantage=2.7,
+        home_court_advantage=float(config.get("home_court_advantage", 2.7)),
         alt_target_low=-250,
         alt_target_high=-200,
         alt_target_mid=-225,
@@ -617,39 +665,71 @@ def render_pick_cards(entries: List[Dict[str, Any]], *, show_score: bool = False
 
 
 def main() -> None:
-    st.set_page_config(page_title="CBB Betting Picks", page_icon="🏀", layout="wide")
-    st.title("🏀 CBB Betting Picks")
+    st.set_page_config(page_title="Basketball Betting Picks", page_icon="🏀", layout="wide")
+    st.title("🏀 Basketball Betting Picks")
     st.caption("Hybrid board: true-line edge, market confirmation, and disciplined final bets.")
 
     with st.sidebar:
         st.header("Settings")
-        league = st.text_input("League", value="ncaab")
-        public_threshold = st.slider("Public skew threshold (%)", 60.0, 95.0, 78.0, 1.0)
+        sport_mode = st.selectbox(
+            "Sport mode",
+            options=list(SPORT_MODE_PRESETS.keys()),
+            index=0,
+            help=(
+                "Uses separate tuned defaults for CBB and NBA while keeping the same "
+                "3-parameter framework."
+            ),
+        )
+        preset = SPORT_MODE_PRESETS[sport_mode]
+        mode_key = str(sport_mode).lower().replace(" ", "_")
+
+        public_threshold = st.slider(
+            "Public skew threshold (%)",
+            60.0,
+            95.0,
+            float(preset["public_threshold"]),
+            1.0,
+            key=f"{mode_key}_public_threshold",
+        )
         public_metric = st.selectbox("Public metric", ["money", "tickets"], index=0)
         true_line_min_edge_points = st.slider(
             "True-line min edge (pts)",
             1.0,
             5.0,
-            2.0,
+            float(preset["true_line_min_edge_points"]),
             0.25,
+            key=f"{mode_key}_true_line_min_edge_points",
         )
         min_probability_edge = st.slider(
             "Min probability edge (%)",
             1.0,
             10.0,
-            3.0,
+            float(preset["min_probability_edge"]) * 100.0,
             0.5,
+            key=f"{mode_key}_min_probability_edge",
         )
         min_liquidity_bets = st.slider(
             "Min liquidity (num bets)",
             100,
             2500,
-            500,
+            int(preset["min_liquidity_bets"]),
             50,
+            key=f"{mode_key}_min_liquidity_bets",
         )
         underdogs_only = st.toggle(
             "Underdogs only (market-only strict mode)",
             value=False,
+            key=f"{mode_key}_underdogs_only",
+        )
+        st.caption(
+            "Mode defaults: league={league}, RLM min={rlm} pts, books={books}, "
+            "late={late}h, pre-window={pre}h.".format(
+                league=preset["league"],
+                rlm=preset["rlm_min_points"],
+                books=preset["rlm_min_book_confirmations"],
+                late=preset["rlm_late_hours"],
+                pre=preset["rlm_pre_window_hours"],
+            )
         )
         day_scope = st.selectbox("Game scope", ["Today + Tomorrow", "Today", "Tomorrow"], index=0)
         selected_books = st.multiselect(
@@ -680,8 +760,9 @@ def main() -> None:
                 "Betting day rollover hour (local)",
                 0,
                 12,
-                5,
+                int(preset.get("day_rollover_hour", 5)),
                 1,
+                key=f"{mode_key}_day_rollover_hour",
                 help=(
                     "Before this hour, the app treats games as part of the previous betting day "
                     "(helps overnight boards keep showing active slates)."
@@ -725,13 +806,27 @@ def main() -> None:
                 )
 
     config = {
-        "league": league.strip() or "ncaab",
+        "sport_mode": sport_mode,
+        "league": str(preset["league"]),
         "public_threshold": float(public_threshold),
         "public_metric": public_metric,
         "true_line_min_edge_points": float(true_line_min_edge_points),
         "min_probability_edge": float(min_probability_edge) / 100.0,
         "min_liquidity_bets": float(min_liquidity_bets),
         "underdogs_only": bool(underdogs_only),
+        "rlm_min_points": float(preset["rlm_min_points"]),
+        "rlm_strong_points": float(preset["rlm_strong_points"]),
+        "rlm_late_hours": float(preset["rlm_late_hours"]),
+        "rlm_pre_window_hours": float(preset["rlm_pre_window_hours"]),
+        "allow_pre_late_confirmation": bool(preset["allow_pre_late_confirmation"]),
+        "rlm_min_book_confirmations": int(preset["rlm_min_book_confirmations"]),
+        "avoid_big_favorite_points": float(preset["avoid_big_favorite_points"]),
+        "big_favorite_min_edge": float(preset["big_favorite_min_edge"]),
+        "key_number_buffer": float(preset["key_number_buffer"]),
+        "key_number_extra_edge": float(preset["key_number_extra_edge"]),
+        "cover_probability_scale": float(preset["cover_probability_scale"]),
+        "home_court_advantage": float(preset["home_court_advantage"]),
+        "flat_bet_units": float(preset["flat_bet_units"]),
         "timezone": timezone_name.strip() or "America/New_York",
         "day_rollover_hour": int(day_rollover_hour),
         "day_start_offset": 0 if day_scope != "Tomorrow" else 1,
@@ -860,9 +955,11 @@ def main() -> None:
     m4.metric("Parameter 3 picks", p3_count)
 
     st.caption(
-        "Generated: {generated} | Metric: {metric} | Public skew ≥ {threshold}% | "
+        "Mode: {mode} ({league}) | Generated: {generated} | Metric: {metric} | Public skew ≥ {threshold}% | "
         "True-line edge ≥ {true_edge} pts | Prob edge ≥ {prob_edge}% | "
         "Books: {books} | Advanced triggers: {advanced} | Scope: {scope} ({window})".format(
+            mode=config.get("sport_mode", "unknown"),
+            league=metadata.get("league", "unknown"),
             generated=metadata.get("generated_at_utc", "unknown"),
             metric=metadata.get("public_metric", "unknown"),
             threshold=metadata.get("public_threshold_pct", "unknown"),
