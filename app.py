@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import hashlib
 import json
 import os
@@ -28,6 +29,7 @@ DEFAULT_BOOK_OPTIONS = [
     (79, "bet365"),
 ]
 LOCAL_CACHE_PATH = ".streamlit_cache/last_non_empty_report.json"
+MAX_FALLBACK_REPORT_AGE_HOURS = 10
 SPORT_MODE_PRESETS: Dict[str, Dict[str, Any]] = {
     "CBB Hybrid": {
         "league": "ncaab",
@@ -122,6 +124,29 @@ def save_local_cached_report(report: Dict[str, Any], cache_key: str) -> None:
         json.dump(report, file_handle)
 
 
+def parse_generated_at_utc(report: Dict[str, Any]) -> dt.datetime | None:
+    ts = str((report.get("metadata") or {}).get("generated_at_utc") or "").strip()
+    if not ts:
+        return None
+    try:
+        if ts.endswith("Z"):
+            ts = ts[:-1] + "+00:00"
+        parsed = dt.datetime.fromisoformat(ts)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=dt.timezone.utc)
+        return parsed.astimezone(dt.timezone.utc)
+    except Exception:
+        return None
+
+
+def is_report_fresh(report: Dict[str, Any], *, max_age_hours: int) -> bool:
+    generated_at = parse_generated_at_utc(report)
+    if generated_at is None:
+        return False
+    age_seconds = (dt.datetime.now(tz=dt.timezone.utc) - generated_at).total_seconds()
+    return age_seconds <= float(max_age_hours) * 3600.0
+
+
 def build_engine_args(config: Dict[str, Any]) -> argparse.Namespace:
     return argparse.Namespace(
         league=config["league"],
@@ -186,7 +211,7 @@ def run_report_uncached(config: Dict[str, Any]) -> Dict[str, Any]:
     return run_analysis(args)
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=120)
 def load_report_cached(config_json: str, refresh_key: int) -> Dict[str, Any]:
     del refresh_key
     config = json.loads(config_json)
@@ -890,7 +915,13 @@ def main() -> None:
             report = load_report_cached(config_json, refresh_key)
         except Exception as exc:
             fallback_report = last_successful_reports.get(cache_key)
-            if fallback_report:
+            if (
+                isinstance(fallback_report, dict)
+                and is_report_fresh(
+                    fallback_report,
+                    max_age_hours=MAX_FALLBACK_REPORT_AGE_HOURS,
+                )
+            ):
                 st.warning(f"Live refresh failed ({exc}). Showing last successful snapshot.")
                 report = fallback_report
             else:
@@ -898,7 +929,13 @@ def main() -> None:
                     cache_key,
                     expected_league=str(config.get("league") or ""),
                 )
-                if disk_cache:
+                if (
+                    isinstance(disk_cache, dict)
+                    and is_report_fresh(
+                        disk_cache,
+                        max_age_hours=MAX_FALLBACK_REPORT_AGE_HOURS,
+                    )
+                ):
                     st.warning(
                         f"Live refresh failed ({exc}). Showing locally cached snapshot."
                     )
@@ -946,7 +983,14 @@ def main() -> None:
 
     if game_count == 0 and not scope_window_empty:
         last_non_empty = last_non_empty_reports.get(cache_key)
-        if isinstance(last_non_empty, dict) and len(last_non_empty.get("all_games_snapshot", [])) > 0:
+        if (
+            isinstance(last_non_empty, dict)
+            and len(last_non_empty.get("all_games_snapshot", [])) > 0
+            and is_report_fresh(
+                last_non_empty,
+                max_age_hours=MAX_FALLBACK_REPORT_AGE_HOURS,
+            )
+        ):
             st.warning("Live source returned 0 games. Showing last non-empty snapshot.")
             report = last_non_empty
             game_count = len(report.get("all_games_snapshot", []))
@@ -955,7 +999,14 @@ def main() -> None:
                 cache_key,
                 expected_league=str(config.get("league") or ""),
             )
-            if isinstance(disk_cache, dict) and len(disk_cache.get("all_games_snapshot", [])) > 0:
+            if (
+                isinstance(disk_cache, dict)
+                and len(disk_cache.get("all_games_snapshot", [])) > 0
+                and is_report_fresh(
+                    disk_cache,
+                    max_age_hours=MAX_FALLBACK_REPORT_AGE_HOURS,
+                )
+            ):
                 st.warning("Live source returned 0 games. Showing locally cached snapshot.")
                 report = disk_cache
                 game_count = len(report.get("all_games_snapshot", []))
