@@ -92,7 +92,11 @@ def local_cache_path(cache_key: str) -> str:
     return f".streamlit_cache/last_non_empty_report_{cache_key}.json"
 
 
-def load_local_cached_report(cache_key: str) -> Dict[str, Any] | None:
+def load_local_cached_report(
+    cache_key: str,
+    *,
+    expected_league: str | None = None,
+) -> Dict[str, Any] | None:
     path = local_cache_path(cache_key)
     if not os.path.exists(path):
         # Backward compatibility for previously cached single-file snapshot.
@@ -101,7 +105,12 @@ def load_local_cached_report(cache_key: str) -> Dict[str, Any] | None:
         return None
     try:
         with open(path, "r", encoding="utf-8") as file_handle:
-            return json.load(file_handle)
+            payload = json.load(file_handle)
+        if expected_league:
+            cached_league = str((payload.get("metadata") or {}).get("league") or "")
+            if cached_league and cached_league != str(expected_league):
+                return None
+        return payload
     except Exception:
         return None
 
@@ -885,7 +894,10 @@ def main() -> None:
                 st.warning(f"Live refresh failed ({exc}). Showing last successful snapshot.")
                 report = fallback_report
             else:
-                disk_cache = load_local_cached_report(cache_key)
+                disk_cache = load_local_cached_report(
+                    cache_key,
+                    expected_league=str(config.get("league") or ""),
+                )
                 if disk_cache:
                     st.warning(
                         f"Live refresh failed ({exc}). Showing locally cached snapshot."
@@ -939,7 +951,10 @@ def main() -> None:
             report = last_non_empty
             game_count = len(report.get("all_games_snapshot", []))
         else:
-            disk_cache = load_local_cached_report(cache_key)
+            disk_cache = load_local_cached_report(
+                cache_key,
+                expected_league=str(config.get("league") or ""),
+            )
             if isinstance(disk_cache, dict) and len(disk_cache.get("all_games_snapshot", [])) > 0:
                 st.warning("Live source returned 0 games. Showing locally cached snapshot.")
                 report = disk_cache
