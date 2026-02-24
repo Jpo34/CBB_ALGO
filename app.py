@@ -1054,6 +1054,12 @@ def main() -> None:
     m2.metric("Parameter 1 picks", p1_count)
     m3.metric("Parameter 2 picks", p2_count)
     m4.metric("Parameter 3 picks", p3_count)
+    st.caption(
+        "Board feed games: {board} | Games in selected day window: {window}".format(
+            board=metadata.get("board_games_count", "unknown"),
+            window=metadata.get("window_games_count", "unknown"),
+        )
+    )
 
     st.caption(
         "Mode: {mode} ({league}) | Generated: {generated} | Metric: {metric} | Public skew ≥ {threshold}% | "

@@ -518,18 +518,23 @@ def fetch_board_data(
 
     # If HTML is challenged or unavailable, use Next.js data route fallback.
     if not discovered_build_id:
-        league_url = f"{ACTION_SITE_ROOT}/{league}"
-        response = request_with_retries(
-            session,
-            league_url,
-            params={"_ts": int(time.time() * 1000)},
-            timeout=request_timeout,
-            retries=request_retries,
-        )
-        parsed = parse_board_html_payload(response.text, league)
-        if parsed:
-            _, _, _, build_id = parsed
-            discovered_build_id = build_id
+        for probe_path in (f"/{league}", "/", "/404"):
+            probe_url = f"{ACTION_SITE_ROOT}{probe_path}"
+            response = request_with_retries(
+                session,
+                probe_url,
+                params={"_ts": int(time.time() * 1000)},
+                timeout=request_timeout,
+                retries=request_retries,
+            )
+            parsed = parse_board_html_payload(response.text, league)
+            if parsed:
+                _, _, _, build_id = parsed
+                discovered_build_id = build_id
+            if not discovered_build_id:
+                discovered_build_id = extract_build_id_from_html(response.text)
+            if discovered_build_id:
+                break
 
     if discovered_build_id:
         for route_name in ("public-betting", "odds"):
