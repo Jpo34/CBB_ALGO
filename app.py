@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from collections import defaultdict
@@ -73,19 +74,42 @@ SPORT_MODE_PRESETS: Dict[str, Dict[str, Any]] = {
 }
 
 
-def load_local_cached_report() -> Dict[str, Any] | None:
-    if not os.path.exists(LOCAL_CACHE_PATH):
+def build_cache_key(config: Dict[str, Any]) -> str:
+    key_fields = {
+        "sport_mode": config.get("sport_mode"),
+        "league": config.get("league"),
+        "timezone": config.get("timezone"),
+        "day_rollover_hour": config.get("day_rollover_hour"),
+        "day_start_offset": config.get("day_start_offset"),
+        "days_ahead": config.get("days_ahead"),
+        "book_ids": config.get("book_ids"),
+    }
+    serialized = json.dumps(key_fields, sort_keys=True)
+    return hashlib.sha1(serialized.encode("utf-8")).hexdigest()[:16]
+
+
+def local_cache_path(cache_key: str) -> str:
+    return f".streamlit_cache/last_non_empty_report_{cache_key}.json"
+
+
+def load_local_cached_report(cache_key: str) -> Dict[str, Any] | None:
+    path = local_cache_path(cache_key)
+    if not os.path.exists(path):
+        # Backward compatibility for previously cached single-file snapshot.
+        path = LOCAL_CACHE_PATH
+    if not os.path.exists(path):
         return None
     try:
-        with open(LOCAL_CACHE_PATH, "r", encoding="utf-8") as file_handle:
+        with open(path, "r", encoding="utf-8") as file_handle:
             return json.load(file_handle)
     except Exception:
         return None
 
 
-def save_local_cached_report(report: Dict[str, Any]) -> None:
-    os.makedirs(os.path.dirname(LOCAL_CACHE_PATH), exist_ok=True)
-    with open(LOCAL_CACHE_PATH, "w", encoding="utf-8") as file_handle:
+def save_local_cached_report(report: Dict[str, Any], cache_key: str) -> None:
+    path = local_cache_path(cache_key)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as file_handle:
         json.dump(report, file_handle)
 
 
@@ -839,18 +863,29 @@ def main() -> None:
         "request_retries": int(request_retries),
     }
     config_json = json.dumps(config, sort_keys=True)
+    cache_key = build_cache_key(config)
+
+    last_successful_reports = st.session_state.get("last_successful_reports")
+    if not isinstance(last_successful_reports, dict):
+        last_successful_reports = {}
+        st.session_state["last_successful_reports"] = last_successful_reports
+
+    last_non_empty_reports = st.session_state.get("last_non_empty_reports")
+    if not isinstance(last_non_empty_reports, dict):
+        last_non_empty_reports = {}
+        st.session_state["last_non_empty_reports"] = last_non_empty_reports
 
     st.info("Loading live picks from the hybrid model...")
     with st.spinner("Fetching games and generating layered picks..."):
         try:
             report = load_report_cached(config_json, refresh_key)
         except Exception as exc:
-            fallback_report = st.session_state.get("last_successful_report")
+            fallback_report = last_successful_reports.get(cache_key)
             if fallback_report:
                 st.warning(f"Live refresh failed ({exc}). Showing last successful snapshot.")
                 report = fallback_report
             else:
-                disk_cache = load_local_cached_report()
+                disk_cache = load_local_cached_report(cache_key)
                 if disk_cache:
                     st.warning(
                         f"Live refresh failed ({exc}). Showing locally cached snapshot."
@@ -860,7 +895,7 @@ def main() -> None:
                     st.error(f"Failed to load report: {exc}")
                     st.stop()
         else:
-            st.session_state["last_successful_report"] = report
+            last_successful_reports[cache_key] = report
 
     metadata = report.get("metadata", {})
     game_count = len(report.get("all_games_snapshot", []))
@@ -898,13 +933,13 @@ def main() -> None:
             )
 
     if game_count == 0 and not scope_window_empty:
-        last_non_empty = st.session_state.get("last_non_empty_report")
+        last_non_empty = last_non_empty_reports.get(cache_key)
         if isinstance(last_non_empty, dict) and len(last_non_empty.get("all_games_snapshot", [])) > 0:
             st.warning("Live source returned 0 games. Showing last non-empty snapshot.")
             report = last_non_empty
             game_count = len(report.get("all_games_snapshot", []))
         else:
-            disk_cache = load_local_cached_report()
+            disk_cache = load_local_cached_report(cache_key)
             if isinstance(disk_cache, dict) and len(disk_cache.get("all_games_snapshot", [])) > 0:
                 st.warning("Live source returned 0 games. Showing locally cached snapshot.")
                 report = disk_cache
@@ -928,15 +963,15 @@ def main() -> None:
                     )
                     report = retry_report
                     game_count = retry_games
-                    st.session_state["last_non_empty_report"] = report
-                    save_local_cached_report(report)
+                    last_non_empty_reports[cache_key] = report
+                    save_local_cached_report(report, cache_key)
                 else:
                     st.warning(
                         "Live source returned 0 games. This can happen temporarily while odds providers update."
                     )
     if game_count > 0:
-        st.session_state["last_non_empty_report"] = report
-        save_local_cached_report(report)
+        last_non_empty_reports[cache_key] = report
+        save_local_cached_report(report, cache_key)
 
     metadata = report.get("metadata", {})
     entries = normalize_parameter_entries(report)
