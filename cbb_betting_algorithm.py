@@ -454,6 +454,32 @@ def fetch_board_data(
     challenge_seen = False
     collected_game_links: Dict[int, str] = {}
     fallback_all_books: Dict[str, Dict[str, Any]] = {}
+    best_games: List[Dict[str, Any]] = []
+    best_all_books: Dict[str, Dict[str, Any]] = {}
+    best_game_links: Dict[int, str] = {}
+
+    def update_best_candidate(
+        games: List[Dict[str, Any]],
+        all_books: Dict[str, Dict[str, Any]],
+        game_links: Dict[int, str],
+    ) -> None:
+        nonlocal best_games, best_all_books, best_game_links
+        if not games:
+            return
+        merged_links = dict(collected_game_links)
+        merged_links.update(game_links or {})
+        should_replace = False
+        if len(games) > len(best_games):
+            should_replace = True
+        elif len(games) == len(best_games):
+            # Tie-breaker: prefer richer sportsbook metadata.
+            if len(all_books or {}) > len(best_all_books or {}):
+                should_replace = True
+        if should_replace:
+            best_games = games
+            best_all_books = all_books or {}
+            best_game_links = merged_links
+
     for path in candidate_paths:
         url = f"{ACTION_SITE_ROOT}{path}"
         for attempt in range(1, request_retries + 1):
@@ -482,9 +508,8 @@ def fetch_board_data(
                     fallback_all_books = all_books
                 if build_id:
                     discovered_build_id = build_id
-                # Only accept this source if we actually got games.
                 if response.status_code in (200, 202) and games:
-                    return games, all_books, game_links
+                    update_best_candidate(games, all_books, game_links)
             if response.status_code == 202 and attempt < request_retries:
                 challenge_seen = True
                 time.sleep(min(4, attempt + 1))
@@ -519,9 +544,7 @@ def fetch_board_data(
             if next_data_result is not None:
                 games, all_books, game_links = next_data_result
                 if games:
-                    merged_links = dict(collected_game_links)
-                    merged_links.update(game_links or {})
-                    return games, all_books, merged_links
+                    update_best_candidate(games, all_books, game_links)
 
     # Last fallback: API scoreboard + books index.
     scoreboard_url = f"{ACTION_API_ROOT}/v1/scoreboard/{league}"
@@ -540,7 +563,7 @@ def fetch_board_data(
                 request_timeout=request_timeout,
                 request_retries=request_retries,
             )
-            return games, all_books, collected_game_links
+            update_best_candidate(games, all_books, {})
 
     # Fallback via game links extracted from challenged HTML.
     if collected_game_links:
@@ -557,7 +580,10 @@ def fetch_board_data(
                 request_timeout=request_timeout,
                 request_retries=request_retries,
             )
-            return hydrated_games, all_books, collected_game_links
+            update_best_candidate(hydrated_games, all_books, collected_game_links)
+
+    if best_games:
+        return best_games, best_all_books, best_game_links
 
     # Graceful fallback: return empty board rather than raising.
     # The app layer can show cached/last-known data when this happens.
