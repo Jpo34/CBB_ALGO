@@ -32,6 +32,7 @@ import requests
 
 
 ACTION_SITE_ROOT = "https://www.actionnetwork.com"
+ACTION_STATIC_SITE_ROOT = "https://static-web-prod.actionnetwork.com"
 ACTION_API_ROOT = "https://api.actionnetwork.com/web"
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -48,6 +49,8 @@ DEFAULT_REQUEST_RETRIES = 3
 DEFAULT_TIMEZONE = "America/New_York"
 DEFAULT_DAYS_AHEAD = 1
 DEFAULT_DAY_ROLLOVER_HOUR = 5
+PARTIAL_SCOREBOARD_LEAGUES = {"ncaab"}
+PARTIAL_SCOREBOARD_MAX_GAMES = 7
 KEY_SPREAD_NUMBERS = (3.0, 4.0, 7.0, 10.0)
 MAJOR_MARKET_CONFERENCES = {
     "ACC",
@@ -313,8 +316,9 @@ def fetch_next_data_board(
     route_name: str,
     request_timeout: int,
     request_retries: int,
+    site_root: str = ACTION_SITE_ROOT,
 ) -> Optional[Tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]], Dict[int, str]]]:
-    url = f"{ACTION_SITE_ROOT}/_next/data/{build_id}/{league}/{route_name}.json"
+    url = f"{site_root}/_next/data/{build_id}/{league}/{route_name}.json"
     response = request_with_retries(
         session,
         url,
@@ -550,6 +554,81 @@ def fetch_board_data(
                 games, all_books, game_links = next_data_result
                 if games:
                     update_best_candidate(games, all_books, game_links)
+
+    # CBB safeguard: if we're still stuck on a tiny slate with no game links,
+    # try the static host's Next.js payload before accepting partial scoreboard data.
+    if (
+        league in PARTIAL_SCOREBOARD_LEAGUES
+        and len(best_games) <= PARTIAL_SCOREBOARD_MAX_GAMES
+        and not best_game_links
+    ):
+        static_build_id = discovered_build_id
+
+        for path in candidate_paths:
+            static_url = f"{ACTION_STATIC_SITE_ROOT}{path}"
+            response = request_with_retries(
+                session,
+                static_url,
+                params={"_ts": int(time.time() * 1000)},
+                timeout=request_timeout,
+                retries=request_retries,
+            )
+            html = response.text
+
+            links_from_html = build_game_links_from_html(html, league)
+            if links_from_html:
+                collected_game_links.update(links_from_html)
+
+            extracted_build = extract_build_id_from_html(html)
+            if extracted_build and not static_build_id:
+                static_build_id = extracted_build
+
+            parsed = parse_board_html_payload(html, league)
+            if not parsed:
+                continue
+            games, all_books, game_links, build_id = parsed
+            collected_game_links.update(game_links)
+            if all_books:
+                fallback_all_books = all_books
+            if build_id and not static_build_id:
+                static_build_id = build_id
+            if response.status_code in (200, 202) and games:
+                update_best_candidate(games, all_books, game_links)
+
+        if not static_build_id:
+            for probe_path in (f"/{league}", "/", "/404"):
+                probe_url = f"{ACTION_STATIC_SITE_ROOT}{probe_path}"
+                response = request_with_retries(
+                    session,
+                    probe_url,
+                    params={"_ts": int(time.time() * 1000)},
+                    timeout=request_timeout,
+                    retries=request_retries,
+                )
+                parsed = parse_board_html_payload(response.text, league)
+                if parsed:
+                    _, _, _, build_id = parsed
+                    static_build_id = build_id
+                if not static_build_id:
+                    static_build_id = extract_build_id_from_html(response.text)
+                if static_build_id:
+                    break
+
+        if static_build_id:
+            for route_name in ("public-betting", "odds"):
+                next_data_result = fetch_next_data_board(
+                    session,
+                    league=league,
+                    build_id=static_build_id,
+                    route_name=route_name,
+                    request_timeout=request_timeout,
+                    request_retries=request_retries,
+                    site_root=ACTION_STATIC_SITE_ROOT,
+                )
+                if next_data_result is not None:
+                    games, all_books, game_links = next_data_result
+                    if games:
+                        update_best_candidate(games, all_books, game_links)
 
     # Last fallback: API scoreboard + books index.
     scoreboard_url = f"{ACTION_API_ROOT}/v1/scoreboard/{league}"
